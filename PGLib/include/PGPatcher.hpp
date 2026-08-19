@@ -85,6 +85,10 @@ public:
      *
      * @param multiThread whether to use multithreading
      * @param excludeFacegens whether to skip patching facegen meshes
+     * @param dryRun when true, runs the full matching pass (so PGModManager's conflict/shader data
+     * gets populated exactly as a real run would) but skips writing any patched mesh to disk. Used
+     * by the conflicts-only CLI path, which only needs PGModManager's resulting state, not real
+     * output.
      */
     static void patchMeshes(const bool& multiThread = true,
                             const bool& forceBasePatch = false,
@@ -92,7 +96,8 @@ public:
                             const bool& checkAllowedRecTypes = false,
                             const bool& excludeFacegens = false,
                             const std::function<void(size_t,
-                                                     size_t)>& progressCallback = {});
+                                                     size_t)>& progressCallback = {},
+                            const bool& dryRun = false);
 
     /**
      * @brief Run texture patcher
@@ -172,7 +177,8 @@ private:
                          const bool& forceBasePatch = false,
                          const std::unordered_set<PGPlugin::ModelRecordType>& allowedModelRecTypes = {},
                          const bool& checkAllowedRecTypes = false,
-                         const bool& excludeFacegens = false) -> TaskTracker::Result;
+                         const bool& excludeFacegens = false,
+                         const bool& dryRun = false) -> TaskTracker::Result;
 
     // NIF Helpers
 

@@ -80,7 +80,8 @@ void PGPatcher::patchMeshes(const bool& multiThread,
                             const bool& checkAllowedRecTypes,
                             const bool& excludeFacegens,
                             const std::function<void(size_t,
-                                                     size_t)>& progressCallback)
+                                                     size_t)>& progressCallback,
+                            const bool& dryRun)
 {
     auto* const pgd = PGGlobals::getPGD();
     pgd->waitForMeshMapping();
@@ -117,9 +118,15 @@ void PGPatcher::patchMeshes(const bool& multiThread,
                             &forceBasePatch,
                             &allowedModelRecTypes,
                             &checkAllowedRecTypes,
-                            &excludeFacegens] {
-            taskTracker.completeJob(patchNIF(
-                mesh, setModelUsesQueue, forceBasePatch, allowedModelRecTypes, checkAllowedRecTypes, excludeFacegens));
+                            &excludeFacegens,
+                            &dryRun] {
+            taskTracker.completeJob(patchNIF(mesh,
+                                             setModelUsesQueue,
+                                             forceBasePatch,
+                                             allowedModelRecTypes,
+                                             checkAllowedRecTypes,
+                                             excludeFacegens,
+                                             dryRun));
         });
     }
 
@@ -390,7 +397,8 @@ auto PGPatcher::patchNIF(const std::filesystem::path& nifPath,
                          const bool& forceBasePatch,
                          const std::unordered_set<PGPlugin::ModelRecordType>& allowedModelRecTypes,
                          const bool& checkAllowedRecTypes,
-                         const bool& excludeFacegens) -> TaskTracker::Result
+                         const bool& excludeFacegens,
+                         const bool& dryRun) -> TaskTracker::Result
 {
     const Logger::Prefix nifPrefix(nifPath.wstring());
 
@@ -494,28 +502,42 @@ auto PGPatcher::patchNIF(const std::filesystem::path& nifPath,
         }
     }
 
-    // Save meshes
-    const auto saveResults = meshTracker.saveMeshes();
-    setModelUsesQueue.queueTask([saveResults]() -> void { PGPlugin::setModelUses(saveResults.first); });
+    // Save meshes -- skipped entirely in dry-run mode (conflicts-only CLI path). Everything the
+    // conflicts JSON actually needs (PGModManager's shaders/conflicts sets) is already fully
+    // populated by this point via getMatches, called from processNIF/processNIFShape above --
+    // saveMeshes() itself contributes nothing to that data, it only (a) writes the real output NIF
+    // to disk (queued async via PGGlobals::getFileSaver(), not even synchronous here), (b) creates
+    // real output directories and throws if a stale output file already exists there, and (c) feeds
+    // setModelUsesQueue, which mutates plugin model-use records for the real output -- none of
+    // which a dry run should do. Guarding the whole block (not just the inner ofstream write) is
+    // deliberate: (b)'s directory-creation/exists-check side effects and (c)'s plugin-mutating queue
+    // task both need skipping too, not just the file write itself.
+    if (!dryRun) {
+        const auto saveResults = meshTracker.saveMeshes();
+        setModelUsesQueue.queueTask([saveResults]() -> void { PGPlugin::setModelUses(saveResults.first); });
 
-    // run handlers
-    for (const auto& meshResult : saveResults.first) {
-        Logger::Prefix(L"Handler: " + meshResult.meshPath.wstring());
-        HandlerLightPlacerTracker::handleNIFCreated(nifPath, meshResult.meshPath);
+        // run handlers
+        for (const auto& meshResult : saveResults.first) {
+            Logger::Prefix(L"Handler: " + meshResult.meshPath.wstring());
+            HandlerLightPlacerTracker::handleNIFCreated(nifPath, meshResult.meshPath);
+        }
+        // Add to diff JSON
+        const auto diffJSONKey = utf16toUTF8(nifPath.wstring());
+        if (saveResults.second.second != 0) {
+            // only add to diff if the base mesh actually saved, which is indicated by a non-zero patched crc32
+            Logger::trace("Base mesh was updated, saving diff CRC32: {} -> {}",
+                          saveResults.second.first,
+                          saveResults.second.second);
+
+            const unique_lock lock(s_diffJSONMutex);
+            s_diffJSON[diffJSONKey]["crc32original"] = saveResults.second.first;
+            s_diffJSON[diffJSONKey]["crc32patched"] = saveResults.second.second;
+        }
     }
-    // Add to diff JSON
-    const auto diffJSONKey = utf16toUTF8(nifPath.wstring());
-    if (saveResults.second.second != 0) {
-        // only add to diff if the base mesh actually saved, which is indicated by a non-zero patched crc32
-        Logger::trace(
-            "Base mesh was updated, saving diff CRC32: {} -> {}", saveResults.second.first, saveResults.second.second);
 
-        const unique_lock lock(s_diffJSONMutex);
-        s_diffJSON[diffJSONKey]["crc32original"] = saveResults.second.first;
-        s_diffJSON[diffJSONKey]["crc32patched"] = saveResults.second.second;
-    }
-
-    // Save mesh meta
+    // Save mesh meta -- kept even in dry-run: purely in-memory bookkeeping (no disk I/O), and
+    // already holds the full per-shape match data (mod/shader/matchedPath) gathered via getMatches
+    // above, useful diagnostic data to keep for free.
     {
         const unique_lock lock(s_meshPatchInfoMutex);
         s_meshPatchInfo[nifPath] = meshMeta;
