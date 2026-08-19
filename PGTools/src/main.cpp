@@ -451,8 +451,19 @@ void addArguments(CLI::App& app,
     args.Patch.subCommand->add_option("patcher", args.Patch.patchers, "List of patchers to use")
         ->required()
         ->delimiter(',');
-    args.Patch.subCommand->add_option("source", args.Patch.source, "Source directory")->default_str("");
-    args.Patch.subCommand->add_option("output", args.Patch.output, "Output directory")
+    // `--source`/`--output` named options, REPLACING the positional `source`/`output` this
+    // subcommand used to declare -- confirmed live (docs/plans/2026-08-19-pgpatcher-load-order-
+    // tool.md, vortex-collection-tools) that CLI11 does not reliably bind those positionals once the
+    // preceding delimited-unordered_set "patcher..." positional is present: `pgtools patch truepbr
+    // C:/temp/src` silently left source at its "." default rather than binding the path given, so
+    // in practice the positional form never worked with real values anyway -- only the zero-extra-
+    // args invocation (`patch truepbr`, both defaults) ever actually worked. Named options sidestep
+    // the ambiguity entirely, same fix already proven on the `conflicts` subcommand. (A prior attempt
+    // at declaring BOTH a `--output` named option AND a positional also named "output" side by side
+    // crashed the built exe outright, even on plain `--help` -- reverted; don't reintroduce that
+    // combination.)
+    args.Patch.subCommand->add_option("--source", args.Patch.source, "Source directory")->default_str(".");
+    args.Patch.subCommand->add_option("--output", args.Patch.output, "Output directory")
         ->default_str("ParallaxGen_Output");
     args.Patch.subCommand->add_flag("--high-mem", args.Patch.highMem, "High memory usage mode (default: false)");
 
