@@ -12,6 +12,7 @@
 #include "patchers/PatcherMeshPreFixMeshLighting.hpp"
 #include "patchers/PatcherMeshPreFixTextureSlotCount.hpp"
 #include "patchers/PatcherMeshShaderComplexMaterial.hpp"
+#include "patchers/PatcherMeshShaderDefault.hpp"
 #include "patchers/PatcherMeshShaderTransformParallaxToCM.hpp"
 #include "patchers/PatcherMeshShaderTruePBR.hpp"
 #include "patchers/PatcherMeshShaderVanillaParallax.hpp"
@@ -376,6 +377,23 @@ void mainRunner(PGToolsCLIArgs& args)
 
         // Create patcher factory
         PatcherUtil::PatcherMeshSet meshPatchers;
+        // Default shader patcher -- REQUIRED, unconditional, matching the real GUI's own setup
+        // exactly (PGPatcher/src/main.cpp:486-487 -- no `if` gate at all, registered on every run
+        // regardless of which other shader patchers are active). Confirmed missing from PGTools
+        // entirely until now (zero references anywhere in this project). This represents "the mesh's
+        // own current texture, unmodified" as a real, legitimate candidate in every priority contest
+        // -- without it, a plain texture-replacer mod with no PBR/complex-material config of its own
+        // can never win a shader-conflict match against a lower-priority PBR mod, even when its real
+        // priority is higher and the correct outcome is "leave this mesh alone." Confirmed live
+        // (2026-08-20) via a direct trace comparison against the real GUI on
+        // meshes\armor\_pumpkin_tewoba\scaled31-01_gnd.nif: the real GUI's own trace showed a
+        // "Default / aMidianBorn Armors PBR 4k" candidate (priority 1390) correctly beating a "PBR /
+        // Faultier's PBR Armors and Clothes" candidate (priority 1350) and winning with NO change
+        // (mesh already correct, nothing committed) -- our own trace never had a "Default" candidate
+        // at all, so Faultier's PBR won by default every time, silently patching meshes that should
+        // never have been touched.
+        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
+                                            PatcherMeshShaderDefault::getFactory());
         if (patcherDefs.contains("fixmeshlighting")) {
             meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::getFactory());
         }
@@ -595,6 +613,12 @@ void mainRunner(PGToolsCLIArgs& args)
         // since conflict detection only needs each patcher ACTIVE (so it contributes matches), not
         // its output tuned; every patcher below loads with its own default options.
         PatcherUtil::PatcherMeshSet meshPatchers;
+        // Default shader patcher -- same real gap as `patch`'s own identical block above (see that
+        // comment for the full story). Without this, disabled/lower-priority mods' meshes that
+        // legitimately shouldn't be touched show up as real conflicts/changes in this subcommand's
+        // own dry-run data too, not just in `patch`'s real output.
+        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
+                                            PatcherMeshShaderDefault::getFactory());
         if (args.Conflicts.patchers.contains("parallax")) {
             meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
                                                 PatcherMeshShaderVanillaParallax::getFactory());
