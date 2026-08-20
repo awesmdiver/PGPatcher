@@ -95,6 +95,15 @@ struct PGToolsCLIArgs {
         filesystem::path cfgDir; // optional -- see readProcessingSettings's own comment for why
         bool mapTexturesFromMeshes = false;
         bool highMem = false;
+        // Matches the real GUI's own --consider-allmeshes flag (PGPatcher/src/main.cpp:918) and its
+        // own default (false, main.cpp:77). Previously this subcommand always passed forceBasePatch=
+        // true to patchMeshes() regardless -- meshes with zero real plugin reference (no ARMO/WEAP/
+        // etc. record anywhere uses them) got force-patched using their own baked-in textures instead
+        // of being skipped like the GUI's own default does. Confirmed live (2026-08-19/20): this was
+        // the source of a real ~10,500-file overshoot vs. the director's own fresh GUI run. Left
+        // default-off so this subcommand matches the GUI's own conservative default unless a user
+        // opts in.
+        bool considerAllMeshes = false;
     } Patch;
 
     // docs/plans/2026-08-19-pgpatcher-load-order-tool.md's own "conflicts" subcommand, for
@@ -109,6 +118,9 @@ struct PGToolsCLIArgs {
         filesystem::path output = "ParallaxGen_Output";
         filesystem::path cfgDir;
         filesystem::path jsonOutput;
+        // Same reasoning as Patch.considerAllMeshes above -- default-off, matching the real GUI's own
+        // default, so this dry-run scan reflects what a default-mode `patch` run would actually do.
+        bool considerAllMeshes = false;
     } Conflicts;
 };
 
@@ -366,7 +378,8 @@ void mainRunner(PGToolsCLIArgs& args)
         // call exactly (PGPatcher/src/main.cpp:633-638) -- confirmed by reading it directly that the
         // GUI hardcodes true here, while this subcommand previously left it at its own false default,
         // meaning the allowedmodelrecordtypes setting.json field was silently ignored entirely.
-        PGPatcher::patchMeshes(args.multithreading, true, processingSettings.allowedModelRecTypes, true);
+        PGPatcher::patchMeshes(
+            args.multithreading, args.Patch.considerAllMeshes, processingSettings.allowedModelRecTypes, true);
         PGPatcher::patchTextures(args.multithreading);
 
         // Finalize step
@@ -520,8 +533,13 @@ void mainRunner(PGToolsCLIArgs& args)
         // checkAllowedRecTypes=true + the real allowedModelRecTypes, matching the real GUI's own call
         // (see `patch` subcommand's own identical comment above) -- previously always false/empty
         // here too, silently ignoring the allowedmodelrecordtypes setting.json field.
-        PGPatcher::patchMeshes(
-            args.multithreading, true, processingSettings.allowedModelRecTypes, true, false, {}, true);
+        PGPatcher::patchMeshes(args.multithreading,
+                               args.Conflicts.considerAllMeshes,
+                               processingSettings.allowedModelRecTypes,
+                               true,
+                               false,
+                               {},
+                               true);
 
         // Serialize PGModManager's full mod list -- the NEW contract this subcommand exists to
         // provide (getJSON() on PGModManager is the modrules.json SAVE format -- priority/enabled/
@@ -610,6 +628,11 @@ void addArguments(CLI::App& app,
         "Directory containing settings.json (PGPatcher's own cfg folder) -- optional, used to read the real mesh "
         "blocklist/allowlist/vanillaBSAList so this matches what the real GUI actually scans");
     args.Patch.subCommand->add_flag("--high-mem", args.Patch.highMem, "High memory usage mode (default: false)");
+    // Same flag name/help text as the real GUI's own option (PGPatcher/src/main.cpp:918) -- default
+    // off, matching the GUI's own default (considerAllMeshes=false, main.cpp:77).
+    args.Patch.subCommand->add_flag("--consider-allmeshes",
+                                    args.Patch.considerAllMeshes,
+                                    "Consider all meshes, even those not in plugins, for patching");
 
     args.Conflicts.subCommand = app.add_subcommand(
         "conflicts",
@@ -640,6 +663,9 @@ void addArguments(CLI::App& app,
         ->required();
     args.Conflicts.subCommand->add_option(
         "--json-output", args.Conflicts.jsonOutput, "Write the resulting JSON to this file instead of stdout");
+    args.Conflicts.subCommand->add_flag("--consider-allmeshes",
+                                        args.Conflicts.considerAllMeshes,
+                                        "Consider all meshes, even those not in plugins, for patching");
 }
 }
 
