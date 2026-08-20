@@ -92,6 +92,7 @@ struct PGToolsCLIArgs {
         unordered_set<string> patchers;
         filesystem::path source = ".";
         filesystem::path output = "ParallaxGen_Output";
+        filesystem::path cfgDir; // optional -- see readProcessingSettings's own comment for why
         bool mapTexturesFromMeshes = false;
         bool highMem = false;
     } Patch;
@@ -110,6 +111,85 @@ struct PGToolsCLIArgs {
         filesystem::path jsonOutput;
     } Conflicts;
 };
+
+// PGPatcher's real GUI never scans every mesh it finds -- it passes a real mesh blocklist/allowlist/
+// vanillaBSAList to mapFiles() (PGPatcher/src/main.cpp:575), all sourced from settings.json's own
+// `params.processing.*` fields (PGConfig.cpp's own load logic, confirmed by reading it directly --
+// this mirrors that parsing exactly, key names included). Neither `conflicts` nor `patch` ever read
+// this before -- both called mapFiles({}, {}, {}, {}, ...), completely unfiltered. Confirmed live
+// against the director's real ~2000-mod install (2026-08-19): his real blocklist (default patterns
+// plus his own added `*\actors\*`/`*loadscreen*`) is why his real GUI's own Mesh Patcher phase
+// processes 108,705 meshes while our own unfiltered scan was processing 141,910 -- a ~33,000-mesh
+// gap, `*\actors\*` alone accounting for most of it (66,295 loose files in his own Data/meshes/actors
+// folder). This isn't just a cosmetic count mismatch: those extra ~33,000 meshes are exactly the
+// kind of content (actor/character meshes, LOD, markers, cameras) the real GUI has never needed to
+// handle correctly in its own real (non-dry-run) save pipeline, since it always filters them out
+// first -- a real, live suspect for the `patch` subcommand's own confirmed indefinite hang (see that
+// subcommand's own comment on its still-BSA-excluded PGDirectory construction).
+struct PGProcessingSettings {
+    vector<wstring> blockList;
+    vector<wstring> allowList;
+    vector<pair<wstring, PGEnums::TextureType>> textureMaps;
+    vector<wstring> vanillaBSAList;
+    // Defaults to the same real default the GUI itself falls back to (PGConfig::getDefaultParams)
+    // when settings.json has no explicit `allowedmodelrecordtypes` key -- matches real GUI behavior
+    // for a mod-manager-fresh settings.json, not just an empty set.
+    unordered_set<PGPlugin::ModelRecordType> allowedModelRecTypes = PGPlugin::getDefaultRecTypeSet();
+};
+
+auto readProcessingSettings(const filesystem::path& cfgDir) -> PGProcessingSettings
+{
+    PGProcessingSettings out;
+    if (cfgDir.empty()) {
+        return out; // no cfg dir given -- empty lists, i.e. this subcommand's own prior behavior
+    }
+
+    nlohmann::json settingsJSON;
+    if (!FileUtil::getJSON(cfgDir / "settings.json", settingsJSON)) {
+        spdlog::warn("No settings.json found at {} -- mesh blocklist/allowlist/vanillaBSAList will be "
+                     "empty, unlike the real GUI.",
+                     (cfgDir / "settings.json").string());
+        return out;
+    }
+
+    if (!settingsJSON.contains("params") || !settingsJSON["params"].contains("processing")) {
+        return out;
+    }
+    const auto& proc = settingsJSON["params"]["processing"];
+
+    if (proc.contains("blocklist")) {
+        for (const auto& item : proc["blocklist"]) {
+            out.blockList.push_back(StringUtil::utf8toUTF16(item.get<string>()));
+        }
+    }
+    if (proc.contains("allowlist")) {
+        for (const auto& item : proc["allowlist"]) {
+            out.allowList.push_back(StringUtil::utf8toUTF16(item.get<string>()));
+        }
+    }
+    if (proc.contains("texturemaps")) {
+        for (const auto& item : proc["texturemaps"].items()) {
+            out.textureMaps.emplace_back(StringUtil::utf8toUTF16(item.key()),
+                                         PGEnums::getTexTypeFromStr(item.value().get<string>()));
+        }
+    }
+    if (proc.contains("vanillabsalist")) {
+        for (const auto& item : proc["vanillabsalist"]) {
+            out.vanillaBSAList.push_back(StringUtil::utf8toUTF16(item.get<string>()));
+        }
+    }
+    // Matches PGConfig.cpp's own load logic exactly: only replace the default set if the key is
+    // actually present (clear first, same as the GUI's own loader) -- an absent key keeps the
+    // struct's own default (PGPlugin::getDefaultRecTypeSet()), not an empty set.
+    if (proc.contains("allowedmodelrecordtypes")) {
+        out.allowedModelRecTypes.clear();
+        for (const auto& item : proc["allowedmodelrecordtypes"]) {
+            out.allowedModelRecTypes.insert(PGPlugin::getRecTypeFromString(item.get<string>()));
+        }
+    }
+
+    return out;
+}
 
 void mainRunner(PGToolsCLIArgs& args)
 {
@@ -188,8 +268,17 @@ void mainRunner(PGToolsCLIArgs& args)
         // indefinitely on live testing. `conflicts` below gets the real fix; this one doesn't yet.
         pgd.populateFileMap(false);
 
-        // Map files
-        pgd.mapFiles({}, {}, {}, {}, args.multithreading);
+        // Map files -- now applies the real mesh blocklist/allowlist/vanillaBSAList from
+        // settings.json (readProcessingSettings's own comment has the full story). This was
+        // completely unfiltered before (every {} below), meaning meshes/actors, meshes/lod,
+        // meshes/markers etc. all got processed by the real save pipeline that BSA-inclusion alone
+        // stalled -- a live suspect for that hang, independent of BSAs entirely.
+        const auto processingSettings = readProcessingSettings(args.Patch.cfgDir);
+        pgd.mapFiles(processingSettings.blockList,
+                    processingSettings.allowList,
+                    processingSettings.textureMaps,
+                    processingSettings.vanillaBSAList,
+                    args.multithreading);
 
         // Split patchers into names and options
         unordered_map<string, unordered_map<string, string>> patcherDefs;
@@ -276,7 +365,11 @@ void mainRunner(PGToolsCLIArgs& args)
         }
 
         PGPatcher::loadPatchers(meshPatchers, texPatchers);
-        PGPatcher::patchMeshes(args.multithreading, true);
+        // checkAllowedRecTypes=true + the real allowedModelRecTypes now, matching the real GUI's own
+        // call exactly (PGPatcher/src/main.cpp:633-638) -- confirmed by reading it directly that the
+        // GUI hardcodes true here, while this subcommand previously left it at its own false default,
+        // meaning the allowedmodelrecordtypes setting.json field was silently ignored entirely.
+        PGPatcher::patchMeshes(args.multithreading, true, processingSettings.allowedModelRecTypes, true);
         PGPatcher::patchTextures(args.multithreading);
 
         // Finalize step
@@ -384,8 +477,17 @@ void mainRunner(PGToolsCLIArgs& args)
         // invisible to conflict detection entirely, and now isn't.
         pgd.populateFileMap(true);
 
-        // Map files
-        pgd.mapFiles({}, {}, {}, {}, args.multithreading);
+        // Map files -- now applies the real mesh blocklist/allowlist/vanillaBSAList too, matching
+        // the real GUI exactly (readProcessingSettings's own comment has the full story). Confirmed
+        // live this was the source of a real mesh-count mismatch against the director's own real
+        // PGPatcher run (141,910 unfiltered vs. his real 108,705 after his own blocklist, mostly his
+        // added `*\actors\*` entry) -- this was never about BSAs at all, a separate pre-existing gap.
+        const auto processingSettings = readProcessingSettings(args.Conflicts.cfgDir);
+        pgd.mapFiles(processingSettings.blockList,
+                    processingSettings.allowList,
+                    processingSettings.textureMaps,
+                    processingSettings.vanillaBSAList,
+                    args.multithreading);
 
         // Register only the requested shader (+ shader-transform) patchers. Deliberately simpler
         // than `patch`'s own patcherDefs mechanism -- no per-patcher bracket-syntax options parsing,
@@ -420,7 +522,11 @@ void mainRunner(PGToolsCLIArgs& args)
         const PatcherUtil::PatcherTextureSet texPatchers;
         PGPatcher::loadPatchers(meshPatchers, texPatchers);
 
-        PGPatcher::patchMeshes(args.multithreading, true, {}, false, false, {}, true);
+        // checkAllowedRecTypes=true + the real allowedModelRecTypes, matching the real GUI's own call
+        // (see `patch` subcommand's own identical comment above) -- previously always false/empty
+        // here too, silently ignoring the allowedmodelrecordtypes setting.json field.
+        PGPatcher::patchMeshes(
+            args.multithreading, true, processingSettings.allowedModelRecTypes, true, false, {}, true);
 
         // Serialize PGModManager's full mod list -- the NEW contract this subcommand exists to
         // provide (getJSON() on PGModManager is the modrules.json SAVE format -- priority/enabled/
@@ -469,7 +575,14 @@ void addArguments(CLI::App& app,
                  args.verbosity,
                  "Verbosity level -v for DEBUG data or -vv for TRACE data "
                  "(warning: TRACE data is very verbose)");
-    app.add_flag("--no-multithreading", args.multithreading, "Disable multithreading");
+    // Real, separate, pre-existing bug found live (2026-08-19): CLI11's add_flag on a bool just sets
+    // the bound variable to true whenever the flag is present -- it does not infer "disable" from the
+    // flag's own name. Since args.multithreading already defaults to true, passing --no-multithreading
+    // was a complete no-op the entire time this flag has existed -- confirmed via a live debugger
+    // stack trace showing the "single-threaded" repro was still running the full 22-thread
+    // TaskPoolRunner path. The `{false}` suffix is CLI11's own real syntax for "set to this value when
+    // the flag is passed" -- this is what actually wires --no-multithreading to its own stated meaning.
+    app.add_flag("--no-multithreading{false}", args.multithreading, "Disable multithreading");
     app.add_flag("--shortcut",
                  args.shortcut,
                  "Keep pgtools running at the end (useful if you are running not in a terminal directly)");
@@ -492,6 +605,15 @@ void addArguments(CLI::App& app,
     args.Patch.subCommand->add_option("--source", args.Patch.source, "Source directory")->default_str(".");
     args.Patch.subCommand->add_option("--output", args.Patch.output, "Output directory")
         ->default_str("ParallaxGen_Output");
+    // Optional, not required -- unlike `conflicts`, `patch` predates this whole item and existing
+    // callers (vortex-collection-tools' own /build route, before this change) don't pass it. Missing
+    // this just means the real mesh blocklist/allowlist/vanillaBSAList never get read, matching this
+    // subcommand's own prior behavior exactly -- never a hard failure for omitting it.
+    args.Patch.subCommand->add_option(
+        "--cfg-dir",
+        args.Patch.cfgDir,
+        "Directory containing settings.json (PGPatcher's own cfg folder) -- optional, used to read the real mesh "
+        "blocklist/allowlist/vanillaBSAList so this matches what the real GUI actually scans");
     args.Patch.subCommand->add_flag("--high-mem", args.Patch.highMem, "High memory usage mode (default: false)");
 
     args.Conflicts.subCommand = app.add_subcommand(
