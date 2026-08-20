@@ -459,82 +459,63 @@ void mainRunner(PGToolsCLIArgs& args)
             patcherDefs[patcher.substr(0, openBracket)] = optionSet;
         }
 
-        // Create patcher factory
-        PatcherUtil::PatcherMeshSet meshPatchers;
-        // Default shader patcher -- REQUIRED, unconditional, matching the real GUI's own setup
-        // exactly (PGPatcher/src/main.cpp:486-487 -- no `if` gate at all, registered on every run
-        // regardless of which other shader patchers are active). Confirmed missing from PGTools
-        // entirely until now (zero references anywhere in this project). This represents "the mesh's
-        // own current texture, unmodified" as a real, legitimate candidate in every priority contest
-        // -- without it, a plain texture-replacer mod with no PBR/complex-material config of its own
-        // can never win a shader-conflict match against a lower-priority PBR mod, even when its real
-        // priority is higher and the correct outcome is "leave this mesh alone." Confirmed live
-        // (2026-08-20) via a direct trace comparison against the real GUI on
-        // meshes\armor\_pumpkin_tewoba\scaled31-01_gnd.nif: the real GUI's own trace showed a
-        // "Default / aMidianBorn Armors PBR 4k" candidate (priority 1390) correctly beating a "PBR /
-        // Faultier's PBR Armors and Clothes" candidate (priority 1350) and winning with NO change
-        // (mesh already correct, nothing committed) -- our own trace never had a "Default" candidate
-        // at all, so Faultier's PBR won by default every time, silently patching meshes that should
-        // never have been touched.
-        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
-                                            PatcherMeshShaderDefault::getFactory());
-        if (patcherDefs.contains("fixmeshlighting")) {
-            meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::getFactory());
-        }
-        // Real, confirmed root cause (2026-08-20) of a whole class of the 828 remaining content
-        // mismatches: the real GUI adds this pre-patcher AUTOMATICALLY whenever any real shader
-        // patcher is active (PGPatcher/src/main.cpp:480-484 -- `if (parallax || complexMaterial ||
-        // truePBR)`), not as its own separate user-facing toggle at all. This subcommand instead
-        // treated it as an independent CLI token nobody ever actually passes (neither this session's
-        // own manual tests nor vortex-collection-tools' web route ever included it), so it silently
-        // never ran. Confirmed via a byte-level trace on Skyland AIO's hhdoor01.nif: its original
-        // mesh ships a 6-slot BSShaderTextureSet (nifly's own version-dependent default for non-SSE-
-        // stream NIFs, external/nifly/src/Shaders.cpp:365-374); PatcherMeshPreFixTextureSlotCount
-        // grows any texture set below `SLOT_COUNT` (9) up to exactly 9 slots
-        // (PatcherMeshPreFixTextureSlotCount.cpp:40-44) -- the real GUI's own output has 9, ours had
-        // 6, a 3-slot (12-byte) gap per shape that matched the observed mismatch exactly. Kept the
-        // explicit `fixtextureslotcount` token too, for backward compatibility with any existing
-        // caller that already passes it directly.
-        if (patcherDefs.contains("fixtextureslotcount") || patcherDefs.contains("parallax")
-            || patcherDefs.contains("complexmaterial") || patcherDefs.contains("truepbr")) {
+        // Create patcher factory -- the real activation decisions (which patchers/pre-patchers/
+        // post-patchers get built into this set, and under what conditions) now live in ONE shared
+        // place, PGPatcher::buildStandardMeshPatcherSet() (PGLib/src/PGPatcher.cpp), consumed by both
+        // this subcommand and the real GUI's own equivalent block. This is a direct structural fix
+        // for the literal failure mode all five of tonight's real parity bugs shared: two hand-
+        // maintained copies of the same "if (x) { emplace(...) }" logic, with this subcommand's own
+        // copy silently missing pieces the GUI's had all along. See that function's own doc comment
+        // (PGLib/include/PGPatcher.hpp) for exactly what it does and does NOT cover -- it only
+        // decides set membership, not loadOptions()/loadStatics()/shader-hook initialization, which
+        // stay each caller's own responsibility below, completely unchanged from before this refactor.
+        PGPatcher::ActivePatcherRequest activePatchers;
+        activePatchers.fixMeshLighting = patcherDefs.contains("fixmeshlighting");
+        activePatchers.parallax = patcherDefs.contains("parallax");
+        activePatchers.complexMaterial = patcherDefs.contains("complexmaterial");
+        activePatchers.truePBR = patcherDefs.contains("truepbr");
+        activePatchers.parallaxToCM = patcherDefs.contains("parallaxtocm");
+        activePatchers.restoreDefaultShaders = patcherDefs.contains("restoredefaultshaders");
+        activePatchers.fixSSS = patcherDefs.contains("fixsss");
+        activePatchers.hairFlowMap = patcherDefs.contains("hairflowmap");
+        // fixtextureslotcount kept as its own explicit token for backward compatibility (existing
+        // callers may already pass it directly) -- the shared function's own condition already covers
+        // the GUI's real auto-activation case (parallax/complexMaterial/truePBR active), so this only
+        // matters for a caller wanting it WITHOUT any of those three, which the shared function alone
+        // wouldn't trigger.
+        auto meshPatchers = PGPatcher::buildStandardMeshPatcherSet(activePatchers);
+        // Only add it again if the shared function's own condition (parallax/complexMaterial/
+        // truePBR) didn't already add it -- checking the source booleans directly, not the resulting
+        // vector's emptiness, since fixMeshLighting can independently populate prePatchers too and
+        // would make an empty()-check wrongly skip this when it shouldn't (or double-add when it's
+        // already there -- either way, checking the real source condition is the only correct test).
+        if (patcherDefs.contains("fixtextureslotcount")
+            && !(activePatchers.parallax || activePatchers.complexMaterial || activePatchers.truePBR)) {
             meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
         }
-        if (patcherDefs.contains("parallax")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
-                                                PatcherMeshShaderVanillaParallax::getFactory());
-        }
+
+        // Caller-specific option-loading and shader-hook initialization -- deliberately NOT part of
+        // the shared function above (see its own doc comment for why). Unchanged from before this
+        // refactor, still gated on the exact same conditions.
         if (patcherDefs.contains("complexmaterial")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderComplexMaterial::getShaderType(),
-                                                PatcherMeshShaderComplexMaterial::getFactory());
             PatcherMeshShaderComplexMaterial::loadOptions(patcherDefs["complexmaterial"]);
         }
         if (patcherDefs.contains("truepbr")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderTruePBR::getShaderType(),
-                                                PatcherMeshShaderTruePBR::getFactory());
             PatcherMeshShaderTruePBR::loadStatics(pgd.getPBRJSONs());
             PatcherMeshShaderTruePBR::loadOptions(patcherDefs["truepbr"]);
         }
         if (patcherDefs.contains("parallaxtocm")) {
-            meshPatchers.shaderTransformPatchers[PatcherMeshShaderTransformParallaxToCM::getFromShader()]
-                = {PatcherMeshShaderTransformParallaxToCM::getToShader(),
-                   PatcherMeshShaderTransformParallaxToCM::getFactory()};
-
             PatcherTextureHookConvertToCM::initShader();
         }
-        if (patcherDefs.contains("particlelightstolp")) {
-            meshPatchers.globalPatchers.emplace_back(PatcherMeshGlobalParticleLightsToLP::getFactory());
-        }
-
-        if (patcherDefs.contains("restoredefaultshaders")) {
-            meshPatchers.postPatchers.emplace_back(PatcherMeshPostRestoreDefaultShaders::getFactory());
-        }
         if (patcherDefs.contains("fixsss")) {
-            meshPatchers.postPatchers.emplace_back(PatcherMeshPostFixSSS::getFactory());
-
             PatcherTextureHookFixSSS::initShader();
         }
-        if (patcherDefs.contains("hairflowmap")) {
-            meshPatchers.postPatchers.emplace_back(PatcherMeshPostHairFlowMap::getFactory());
+
+        // PGTools-only capability -- no GUI equivalent at all (confirmed via a full grep of
+        // PGPatcher/src/main.cpp, zero references), so it stays here rather than in the shared
+        // function, same as before this refactor.
+        if (patcherDefs.contains("particlelightstolp")) {
+            meshPatchers.globalPatchers.emplace_back(PatcherMeshGlobalParticleLightsToLP::getFactory());
         }
 
         PatcherUtil::PatcherTextureSet texPatchers;
@@ -711,42 +692,32 @@ void mainRunner(PGToolsCLIArgs& args)
         // than `patch`'s own patcherDefs mechanism -- no per-patcher bracket-syntax options parsing,
         // since conflict detection only needs each patcher ACTIVE (so it contributes matches), not
         // its output tuned; every patcher below loads with its own default options.
-        PatcherUtil::PatcherMeshSet meshPatchers;
-        // Default shader patcher -- same real gap as `patch`'s own identical block above (see that
-        // comment for the full story). Without this, disabled/lower-priority mods' meshes that
-        // legitimately shouldn't be touched show up as real conflicts/changes in this subcommand's
-        // own dry-run data too, not just in `patch`'s real output.
-        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
-                                            PatcherMeshShaderDefault::getFactory());
-        // Same real gap as `patch`'s own identical fix above -- this subcommand had ZERO prePatchers
-        // registered at all until now, so its own dry-run conflict/shader data never reflected a
-        // texture-slot-count-fixed mesh either, matching what a real `patch` run (now fixed) would
-        // actually see.
-        if (args.Conflicts.patchers.contains("parallax") || args.Conflicts.patchers.contains("complexmaterial")
-            || args.Conflicts.patchers.contains("truepbr")) {
-            meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
-        }
-        if (args.Conflicts.patchers.contains("parallax")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
-                                                PatcherMeshShaderVanillaParallax::getFactory());
-        }
+        //
+        // Same shared PGPatcher::buildStandardMeshPatcherSet() `patch` above now uses -- see that
+        // function's own doc comment (PGLib/include/PGPatcher.hpp) for what it covers. This
+        // subcommand never activates fixMeshLighting/restoreDefaultShaders/fixSSS/hairFlowMap (no
+        // pre-existing behavior to preserve there -- conflict detection never needed post-patchers,
+        // dry-run purpose predates this refactor), so those stay false/default here, unchanged from
+        // before.
+        PGPatcher::ActivePatcherRequest activePatchers;
+        activePatchers.parallax = args.Conflicts.patchers.contains("parallax");
+        activePatchers.complexMaterial = args.Conflicts.patchers.contains("complexmaterial");
+        activePatchers.truePBR = args.Conflicts.patchers.contains("truepbr");
+        activePatchers.parallaxToCM = args.Conflicts.patchers.contains("parallaxtocm");
+        auto meshPatchers = PGPatcher::buildStandardMeshPatcherSet(activePatchers);
+
+        // Caller-specific option-loading and shader-hook initialization -- same reasoning as `patch`
+        // above, unchanged from before this refactor.
         if (args.Conflicts.patchers.contains("complexmaterial")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderComplexMaterial::getShaderType(),
-                                                PatcherMeshShaderComplexMaterial::getFactory());
             unordered_map<string, string> complexMaterialOptions;
             PatcherMeshShaderComplexMaterial::loadOptions(complexMaterialOptions);
         }
         if (args.Conflicts.patchers.contains("truepbr")) {
-            meshPatchers.shaderPatchers.emplace(PatcherMeshShaderTruePBR::getShaderType(),
-                                                PatcherMeshShaderTruePBR::getFactory());
             PatcherMeshShaderTruePBR::loadStatics(pgd.getPBRJSONs());
             unordered_map<string, string> truePBROptions;
             PatcherMeshShaderTruePBR::loadOptions(truePBROptions);
         }
         if (args.Conflicts.patchers.contains("parallaxtocm")) {
-            meshPatchers.shaderTransformPatchers[PatcherMeshShaderTransformParallaxToCM::getFromShader()]
-                = {PatcherMeshShaderTransformParallaxToCM::getToShader(),
-                   PatcherMeshShaderTransformParallaxToCM::getFactory()};
             PatcherTextureHookConvertToCM::initShader();
         }
 

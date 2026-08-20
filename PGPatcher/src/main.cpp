@@ -471,42 +471,51 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     //
     progressWindow->CallAfter([progressWindow]() -> void { progressWindow->setStepLabel(PGTr("progress.steps.initPatchers", "Initializing patchers")); });
 
-    // Create patcher factory
-    PatcherUtil::PatcherMeshSet meshPatchers;
+    // Create patcher factory -- the real activation decisions (which patchers/pre-patchers/post-
+    // patchers get built into this set, and under what conditions) now live in ONE shared place,
+    // PGPatcher::buildStandardMeshPatcherSet() (PGLib/src/PGPatcher.cpp), consumed by both this GUI
+    // and PGTools' own equivalent block. This is a direct structural fix for the literal failure mode
+    // all five real parity bugs found during a 2026-08-20 investigation shared: two hand-maintained
+    // copies of the same "if (x) { emplace(...) }" logic, with PGTools' own copy silently missing
+    // pieces this GUI's had all along, five separate times. See that function's own doc comment
+    // (PGLib/include/PGPatcher.hpp) for exactly what it does and does NOT cover -- it only decides
+    // set membership, not loadOptions()/loadStatics()/shader-hook initialization, which stay this
+    // GUI's own responsibility below, completely unchanged from before this refactor.
+    PGPatcher::ActivePatcherRequest activePatchers;
+    activePatchers.fixMeshLighting = params.PrePatcher.fixMeshLighting;
+    activePatchers.parallax = params.ShaderPatcher.parallax;
+    activePatchers.complexMaterial = params.ShaderPatcher.complexMaterial;
+    activePatchers.truePBR = params.ShaderPatcher.truePBR;
+    activePatchers.parallaxToCM = params.ShaderTransforms.parallaxToCM;
+    activePatchers.restoreDefaultShaders = params.PostPatcher.disablePrePatchedMaterials;
+    activePatchers.fixSSS = params.PostPatcher.fixSSS;
+    activePatchers.hairFlowMap = params.PostPatcher.hairFlowMap;
+    auto meshPatchers = PGPatcher::buildStandardMeshPatcherSet(activePatchers);
+
+    // Caller-specific option-loading and shader-hook initialization -- deliberately NOT part of the
+    // shared function above (see its own doc comment for why: this GUI's own option sources and
+    // error-handling around the shader-hook calls differ from PGTools', and unifying either would
+    // change real behavior for one side or the other). Unchanged from before this refactor, still
+    // gated on the exact same conditions and still logging the same debug lines.
     if (params.PrePatcher.fixMeshLighting) {
         Logger::debug("Adding Mesh Lighting Fix pre-patcher");
-        meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::getFactory());
     }
     if (params.ShaderPatcher.parallax || params.ShaderPatcher.complexMaterial || params.ShaderPatcher.truePBR) {
-        // fix slots only needed for shader patchers
         Logger::debug("Adding Texture Slot Count Fix pre-patcher");
-        meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
     }
-
-    meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
-                                        PatcherMeshShaderDefault::getFactory());
     if (params.ShaderPatcher.parallax) {
         Logger::debug("Adding Parallax shader patcher");
-        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
-                                            PatcherMeshShaderVanillaParallax::getFactory());
     }
     if (params.ShaderPatcher.complexMaterial) {
         Logger::debug("Adding Complex Material shader patcher");
-        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderComplexMaterial::getShaderType(),
-                                            PatcherMeshShaderComplexMaterial::getFactory());
         PatcherMeshShaderComplexMaterial::loadOptions(args.disableDynCubemap);
     }
     if (params.ShaderPatcher.truePBR) {
         Logger::debug("Adding True PBR shader patcher");
-        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderTruePBR::getShaderType(),
-                                            PatcherMeshShaderTruePBR::getFactory());
         PatcherMeshShaderTruePBR::loadOptions(true, params.Processing.enableModDevMode);
     }
     if (params.ShaderTransforms.parallaxToCM) {
         Logger::debug("Adding Parallax to Complex Material shader transform patcher");
-        meshPatchers.shaderTransformPatchers[PatcherMeshShaderTransformParallaxToCM::getFromShader()]
-            = {PatcherMeshShaderTransformParallaxToCM::getToShader(),
-               PatcherMeshShaderTransformParallaxToCM::getFactory()};
         PatcherMeshShaderTransformParallaxToCM::loadOptions(!args.forceAlwaysCM);
 
         // initialize patcher hooks
@@ -517,11 +526,9 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     }
     if (params.PostPatcher.disablePrePatchedMaterials) {
         Logger::debug("Adding Disable Pre-Patched Materials post-patcher");
-        meshPatchers.postPatchers.emplace_back(PatcherMeshPostRestoreDefaultShaders::getFactory());
     }
     if (params.PostPatcher.fixSSS) {
         Logger::debug("Adding SSS fix post-patcher");
-        meshPatchers.postPatchers.emplace_back(PatcherMeshPostFixSSS::getFactory());
 
         if (!PatcherTextureHookFixSSS::initShader()) {
             Logger::critical("Failed to initialize FixSSS shader");
@@ -530,7 +537,6 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     }
     if (params.PostPatcher.hairFlowMap) {
         Logger::debug("Adding Hair Flow Map post-patcher");
-        meshPatchers.postPatchers.emplace_back(PatcherMeshPostHairFlowMap::getFactory());
     }
 
     const PatcherUtil::PatcherTextureSet texPatchers;

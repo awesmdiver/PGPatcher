@@ -5,6 +5,16 @@
 #include "PGGlobals.hpp"
 #include "PGPlugin.hpp"
 #include "handlers/HandlerLightPlacerTracker.hpp"
+#include "patchers/PatcherMeshPostFixSSS.hpp"
+#include "patchers/PatcherMeshPostHairFlowMap.hpp"
+#include "patchers/PatcherMeshPostRestoreDefaultShaders.hpp"
+#include "patchers/PatcherMeshPreFixMeshLighting.hpp"
+#include "patchers/PatcherMeshPreFixTextureSlotCount.hpp"
+#include "patchers/PatcherMeshShaderComplexMaterial.hpp"
+#include "patchers/PatcherMeshShaderDefault.hpp"
+#include "patchers/PatcherMeshShaderTransformParallaxToCM.hpp"
+#include "patchers/PatcherMeshShaderTruePBR.hpp"
+#include "patchers/PatcherMeshShaderVanillaParallax.hpp"
 #include "patchers/PatcherTextureHookConvertToCM.hpp"
 #include "patchers/PatcherTextureHookFixSSS.hpp"
 #include "patchers/base/PatcherMesh.hpp"
@@ -66,6 +76,58 @@ PatcherUtil::PatcherTextureSet PGPatcher::s_texPatchers;
 
 std::shared_mutex PGPatcher::s_diffJSONMutex;
 nlohmann::json PGPatcher::s_diffJSON;
+
+auto PGPatcher::buildStandardMeshPatcherSet(const ActivePatcherRequest& req) -> PatcherUtil::PatcherMeshSet
+{
+    PatcherUtil::PatcherMeshSet meshPatchers;
+
+    if (req.fixMeshLighting) {
+        meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::getFactory());
+    }
+
+    // Fix Texture Slot Count is needed whenever ANY real shader patcher is active -- matches the
+    // real GUI's own condition exactly (PGPatcher/src/main.cpp:480-484, `if (parallax ||
+    // complexMaterial || truePBR)`), not a separate ActivePatcherRequest field of its own (neither
+    // frontend ever exposes it as an independent toggle either -- confirmed by reading both).
+    if (req.parallax || req.complexMaterial || req.truePBR) {
+        meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
+    }
+
+    // Default shader patcher -- UNCONDITIONAL, every real run, matching the real GUI's own setup
+    // exactly (PGPatcher/src/main.cpp:486-487 -- no `if` gate at all). Represents "this mesh's own
+    // current texture, unmodified" as a real, legitimate candidate in every priority-based shader-
+    // conflict decision -- this was root cause #5 of the parity investigation this function exists
+    // because of (2026-08-20): without it, a plain texture-replacer mod with no PBR/complex-material
+    // config of its own could never win a conflict against a lower-priority PBR mod.
+    meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(), PatcherMeshShaderDefault::getFactory());
+
+    if (req.parallax) {
+        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
+                                            PatcherMeshShaderVanillaParallax::getFactory());
+    }
+    if (req.complexMaterial) {
+        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderComplexMaterial::getShaderType(),
+                                            PatcherMeshShaderComplexMaterial::getFactory());
+    }
+    if (req.truePBR) {
+        meshPatchers.shaderPatchers.emplace(PatcherMeshShaderTruePBR::getShaderType(), PatcherMeshShaderTruePBR::getFactory());
+    }
+    if (req.parallaxToCM) {
+        meshPatchers.shaderTransformPatchers[PatcherMeshShaderTransformParallaxToCM::getFromShader()]
+            = {PatcherMeshShaderTransformParallaxToCM::getToShader(), PatcherMeshShaderTransformParallaxToCM::getFactory()};
+    }
+    if (req.restoreDefaultShaders) {
+        meshPatchers.postPatchers.emplace_back(PatcherMeshPostRestoreDefaultShaders::getFactory());
+    }
+    if (req.fixSSS) {
+        meshPatchers.postPatchers.emplace_back(PatcherMeshPostFixSSS::getFactory());
+    }
+    if (req.hairFlowMap) {
+        meshPatchers.postPatchers.emplace_back(PatcherMeshPostHairFlowMap::getFactory());
+    }
+
+    return meshPatchers;
+}
 
 void PGPatcher::loadPatchers(const PatcherUtil::PatcherMeshSet& meshPatchers,
                              const PatcherUtil::PatcherTextureSet& texPatchers)

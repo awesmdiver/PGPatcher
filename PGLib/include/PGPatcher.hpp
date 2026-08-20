@@ -59,6 +59,29 @@ public:
 
     using MeshPatchInfo = std::map<std::filesystem::path, MeshMeta>;
 
+    /**
+     * @struct ActivePatcherRequest
+     * @brief Which real, GUI-and-CLI-shared mesh patchers/pre-patchers/post-patchers should be active
+     * for a run -- the single source of truth consumed by buildStandardMeshPatcherSet() below.
+     *
+     * Deliberately covers only the patchers BOTH the real GUI (PGPatcher/src/main.cpp) and PGTools
+     * (PGTools/src/main.cpp) actually expose -- confirmed by reading both files' own patcher-
+     * activation logic in full (2026-08-20). PGTools-only capabilities with no GUI equivalent at all
+     * (ParticleLightsToLP, ConvertToHDR -- confirmed via a full grep of PGPatcher/src/main.cpp,
+     * zero references to either) are deliberately NOT included here; they stay PGTools-only, built
+     * directly in that file, same as today.
+     */
+    struct ActivePatcherRequest {
+        bool fixMeshLighting = false;
+        bool parallax = false;
+        bool complexMaterial = false;
+        bool truePBR = false;
+        bool parallaxToCM = false;
+        bool restoreDefaultShaders = false;
+        bool fixSSS = false;
+        bool hairFlowMap = false;
+    };
+
 private:
     // Registered Patchers
     static PatcherUtil::PatcherTextureSet s_texPatchers;
@@ -71,6 +94,32 @@ private:
     static inline std::shared_mutex s_meshPatchInfoMutex;
 
 public:
+    /**
+     * @brief Builds the standard (GUI-and-CLI-shared) mesh patcher set from a real ActivePatcherRequest.
+     *
+     * Single source of truth for "which patchers get activated, and under what conditions" -- pulled
+     * out of PGPatcher/src/main.cpp and PGTools/src/main.cpp (2026-08-20) after all five real bugs
+     * found during a parity investigation shared the exact same shape: the two files each hand-
+     * maintained their own copy of this same decision, and PGTools' own copy was silently missing
+     * pieces the GUI's had all along, five separate times. Both frontends now call this one function
+     * instead.
+     *
+     * Deliberately narrow in scope: this ONLY decides which patcher/pre-patcher/post-patcher/shader-
+     * transform-patcher factories go into the returned set -- it does NOT call any patcher's own
+     * loadOptions()/loadStatics(), and does NOT call the shader-hook initShader() functions
+     * (PatcherTextureHookConvertToCM::initShader()/PatcherTextureHookFixSSS::initShader()) that
+     * parallaxToCM/fixSSS also need. Those stay each caller's own responsibility, exactly as today --
+     * the GUI and PGTools use genuinely different option sources (GUI: raw booleans from its own
+     * params/args; PGTools: bracket-parsed CLI option maps) and different error-handling around the
+     * shader-hook calls (GUI: hard-fails the whole run on init failure; PGTools: doesn't check the
+     * return value) -- folding either into this shared function would either lose caller-specific
+     * behavior or require inventing a new one, and a real behavior change here was explicitly out of
+     * scope for this refactor.
+     *
+     * @param req which patchers should be active for this run.
+     */
+    static auto buildStandardMeshPatcherSet(const ActivePatcherRequest& req) -> PatcherUtil::PatcherMeshSet;
+
     /**
      * @brief Allows patchers to be registered and used in the patching process.
      *
