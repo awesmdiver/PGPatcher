@@ -29,6 +29,9 @@
 #include <cpptrace/from_current.hpp>
 #include <nlohmann/json.hpp>
 #include <spdlog/common.h>
+#include <spdlog/logger.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
 #include <array>
@@ -156,6 +159,12 @@ struct PGProcessingSettings {
     // when settings.json has no explicit `allowedmodelrecordtypes` key -- matches real GUI behavior
     // for a mod-manager-fresh settings.json, not just an empty set.
     unordered_set<PGPlugin::ModelRecordType> allowedModelRecTypes = PGPlugin::getDefaultRecTypeSet();
+    // Read for the same reason as everything else in this struct: so PGTools' own logging level
+    // reflects the user's real settings.json (params.processing.enabledebuglogging/
+    // enabletracelogging) rather than requiring a separate -v/-vv CLI flag every time, matching how
+    // the real GUI's own initLogger() is driven entirely by these two settings.json fields.
+    bool enableDebugLogging = false;
+    bool enableTraceLogging = false;
 };
 
 auto readProcessingSettings(const filesystem::path& cfgDir) -> PGProcessingSettings
@@ -208,8 +217,74 @@ auto readProcessingSettings(const filesystem::path& cfgDir) -> PGProcessingSetti
             out.allowedModelRecTypes.insert(PGPlugin::getRecTypeFromString(item.get<string>()));
         }
     }
+    if (proc.contains("enabledebuglogging")) {
+        out.enableDebugLogging = proc["enabledebuglogging"].get<bool>();
+    }
+    if (proc.contains("enabletracelogging")) {
+        out.enableTraceLogging = proc["enabletracelogging"].get<bool>();
+    }
 
     return out;
+}
+
+// Same values as the real GUI's own initLogger (PGPatcher/src/main.cpp:68-69) -- not shared/
+// importable from a common header (checked PGLib first, confirmed GUI-local), so duplicated here
+// rather than introducing new cross-target coupling for two constants.
+constexpr unsigned MAX_LOG_SIZE = 10490000; // 10 MB
+constexpr unsigned MAX_LOG_FILES = 1000;
+
+// Mirrors the real GUI's own initLogger (PGPatcher/src/main.cpp:178-233) as closely as makes sense
+// for a CLI tool -- same rotating file sink, same size/count limits, same log-folder cleanup, same
+// line format, same debug/trace level semantics (including the asymmetric console-vs-file clamp
+// under trace). PGTools previously only ever configured spdlog's own default logger in place
+// (console-only, implicit) -- no file sink, no rotation, no stale-log cleanup -- so a real PGTools
+// run left no record on disk at all once the terminal scrolled past it, unlike every real GUI run.
+void initLogger(const filesystem::path& logpath, bool enableDebug, bool enableTrace)
+{
+    // delete old logs -- same "PGPatcher*.log" match as the GUI's own cleanup, so a PGTools run and
+    // a GUI run pointed at the same log folder don't leave each other's stale files behind either.
+    if (filesystem::exists(logpath.parent_path())) {
+        try {
+            for (const auto& entry : filesystem::directory_iterator(logpath.parent_path())) {
+                if (entry.is_regular_file() && entry.path().extension() == ".log"
+                    && entry.path().filename().wstring().starts_with(L"PGPatcher")) {
+                    filesystem::remove(entry.path());
+                }
+            }
+        } catch (const filesystem::filesystem_error& e) {
+            cerr << "Failed to delete old logs: " << e.what() << "\n";
+        }
+    }
+
+    vector<spdlog::sink_ptr> sinks;
+    auto consoleSink = make_shared<spdlog::sinks::stdout_color_sink_mt>();
+    sinks.push_back(consoleSink);
+
+    auto fileSink = make_shared<spdlog::sinks::rotating_file_sink_mt>(logpath.wstring(), MAX_LOG_SIZE, MAX_LOG_FILES);
+    sinks.push_back(fileSink);
+
+    auto logger = make_shared<spdlog::logger>("PGTools", sinks.begin(), sinks.end());
+
+    spdlog::register_logger(logger);
+    spdlog::set_default_logger(logger);
+    spdlog::set_level(spdlog::level::info);
+    spdlog::flush_on(spdlog::level::info);
+
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+
+    if (enableDebug) {
+        spdlog::set_level(spdlog::level::debug);
+        spdlog::flush_on(spdlog::level::debug);
+        spdlog::debug("DEBUG logging enabled");
+    }
+    if (enableTrace) {
+        spdlog::set_level(spdlog::level::trace);
+        // Same asymmetric clamp as the GUI: trace-level spam stays in the file only, console
+        // output never exceeds debug even when the file sink is capturing full trace detail.
+        consoleSink->set_level(spdlog::level::debug);
+        spdlog::flush_on(spdlog::level::trace);
+        spdlog::trace("TRACE logging enabled");
+    }
 }
 
 void mainRunner(PGToolsCLIArgs& args)
@@ -845,19 +920,29 @@ auto main(int argC,
     // Parse CLI Arguments (this is what exits on any validation issues)
     CLI11_PARSE(app, argC, argV);
 
-    // Initialize Logger
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-
-    // Set logging mode
-    if (args.verbosity >= 1) {
-        spdlog::set_level(spdlog::level::debug);
-        spdlog::debug("DEBUG logging enabled");
+    // Initialize Logger -- mirrors the real GUI's own initLogger (see that function's own comment
+    // above for the full story). Reuses readProcessingSettings() (already reads this same
+    // settings.json for the mesh blocklist/allowlist/etc elsewhere in this file) rather than
+    // hand-rolling a second JSON parse just for these two fields. Whichever subcommand was actually
+    // invoked determines which --cfg-dir to read; if neither subcommand has a cfg-dir (or none was
+    // given at all), readProcessingSettings() already degrades gracefully to false/false, same as
+    // every other field it reads.
+    filesystem::path logCfgDir;
+    if (args.Patch.subCommand->parsed()) {
+        logCfgDir = args.Patch.cfgDir;
+    } else if (args.Conflicts.subCommand->parsed()) {
+        logCfgDir = args.Conflicts.cfgDir;
     }
+    const auto logProcessingSettings = readProcessingSettings(logCfgDir);
 
-    if (args.verbosity >= 2) {
-        spdlog::set_level(spdlog::level::trace);
-        spdlog::trace("TRACE logging enabled");
-    }
+    // Combined with the existing -v/-vv CLI flags rather than replacing them -- either one turning
+    // on debug/trace is enough, so a caller can still force verbosity without needing settings.json,
+    // while a real settings.json with logging already enabled elevates PGTools' own log to match
+    // without requiring the caller to also pass -v/-vv.
+    const bool enableDebug = args.verbosity >= 1 || logProcessingSettings.enableDebugLogging;
+    const bool enableTrace = args.verbosity >= 2 || logProcessingSettings.enableTraceLogging;
+
+    initLogger(exePath / "log" / "PGPatcher.log", enableDebug, enableTrace);
 
     // Main Runner (Catches all exceptions)
     CPPTRACE_TRY { mainRunner(args); }
