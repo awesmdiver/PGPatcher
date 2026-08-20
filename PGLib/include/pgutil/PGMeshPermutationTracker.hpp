@@ -109,6 +109,7 @@ private:
     static inline std::mutex s_otherWeightVariantsMutex;
     static inline std::unordered_map<std::pair<std::filesystem::path, size_t>, nifly::NifFile, PathSizeHash>
         s_otherWeightVariants;
+    static inline bool s_relaxWeightValidation = false;
 
 public:
     /**
@@ -178,6 +179,22 @@ public:
      * @brief Validates all weighted mesh variants across all trackers, ensuring _0/_1 pairs are consistent.
      */
     static void validateWeightedVariants();
+
+    /**
+     * @brief Controls whether a _0/_1 weight-variant mismatch/absence is logged as an error or a warning.
+     *
+     * Purely a log-severity toggle -- never changes which meshes get patched or what gets written to
+     * output (see processWeightVariant()/validateWeightedVariants(), both log-only, no other side
+     * effect). Off by default, matching the real GUI's own current (strict) behavior. Exists because
+     * this check has real, confirmed false positives on legitimate vanilla/mod setups where a mesh's
+     * male and female (or _0/_1) variants are patched asymmetrically for reasons unrelated to any
+     * actual content problem (upstream hakasapl/PGPatcher#729) -- some users want these visible as
+     * warnings rather than counted among real errors, without this tool silently loosening what it
+     * actually checks.
+     *
+     * @param relax True to log at warning level instead of error level.
+     */
+    static void setRelaxWeightValidation(bool relax);
 
 private:
     /**

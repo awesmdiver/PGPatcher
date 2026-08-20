@@ -20,6 +20,7 @@
 #include "patchers/PatcherTextureHookConvertToCM.hpp"
 #include "patchers/PatcherTextureHookFixSSS.hpp"
 #include "patchers/base/PatcherUtil.hpp"
+#include "pgutil/PGMeshPermutationTracker.hpp"
 #include "util/ExceptionHandler.hpp"
 #include "util/FileUtil.hpp"
 #include "util/StringUtil.hpp"
@@ -88,6 +89,12 @@ struct PGToolsCLIArgs {
     int verbosity = 0;
     bool multithreading = true;
     bool shortcut = false;
+    // See PGMeshPermutationTracker::setRelaxWeightValidation's own comment for the full story --
+    // this is a pure log-severity toggle for the real, confirmed false positives in the _0/_1
+    // weight-variant consistency check (upstream hakasapl/PGPatcher#729). Off by default, matching
+    // the real GUI's own current (strict, error-level) behavior exactly -- never changes which
+    // meshes get patched or what output gets written either way.
+    bool relaxWeightValidation = false;
 
     struct Patch {
         CLI::App* subCommand = nullptr;
@@ -219,6 +226,8 @@ void mainRunner(PGToolsCLIArgs& args)
 #endif
 
     ExceptionHandler::setMainThread();
+
+    PGMeshPermutationTracker::setRelaxWeightValidation(args.relaxWeightValidation);
 
     // Check if patch subcommand was used
     if (args.Patch.subCommand->parsed()) {
@@ -739,6 +748,11 @@ void addArguments(CLI::App& app,
     app.add_flag("--shortcut",
                  args.shortcut,
                  "Keep pgtools running at the end (useful if you are running not in a terminal directly)");
+    app.add_flag("--relax-weight-validation",
+                 args.relaxWeightValidation,
+                 "Log _0/_1 weight-variant mesh mismatches as warnings instead of errors -- does not "
+                 "change what gets patched, only how these known-false-positive-prone checks are "
+                 "logged (see hakasapl/PGPatcher#729)");
 
     args.Patch.subCommand = app.add_subcommand("patch", "Patch meshes");
     args.Patch.subCommand->add_option("patcher", args.Patch.patchers, "List of patchers to use")

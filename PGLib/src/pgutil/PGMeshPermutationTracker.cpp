@@ -288,12 +288,19 @@ auto PGMeshPermutationTracker::saveMeshes() -> pair<vector<MeshResult>,
     return {output, {m_origCrc32, baseCrc32}};
 }
 
+void PGMeshPermutationTracker::setRelaxWeightValidation(bool relax) { s_relaxWeightValidation = relax; }
+
 void PGMeshPermutationTracker::validateWeightedVariants()
 {
     const std::scoped_lock lock(s_otherWeightVariantsMutex);
     for (const auto& [key, nifFile] : s_otherWeightVariants) {
-        Logger::error(L"Weighted mesh variant for '{}' not created. Weight variants (_0 and _1) do not match.",
-                      key.first.wstring());
+        if (s_relaxWeightValidation) {
+            Logger::warn(L"Weighted mesh variant for '{}' not created. Weight variants (_0 and _1) do not match.",
+                        key.first.wstring());
+        } else {
+            Logger::error(L"Weighted mesh variant for '{}' not created. Weight variants (_0 and _1) do not match.",
+                          key.first.wstring());
+        }
     }
     s_otherWeightVariants.clear();
 }
@@ -307,10 +314,17 @@ void PGMeshPermutationTracker::processWeightVariant()
     const auto otherVariantPath = getOtherWeightVariant(m_origMeshPath);
     if (s_otherWeightVariants.contains({otherVariantPath, dupIdx})) {
         if (!compareMesh(m_stagedMesh, s_otherWeightVariants[{otherVariantPath, dupIdx}], {}, true, true)) {
-            // different from each other, post error
-            Logger::error(L"Weighted mesh variants '{}' and '{}' do not match.",
-                          m_origMeshPath.wstring(),
-                          otherVariantPath.wstring());
+            // different from each other, post error (or warning, if relaxed -- see
+            // setRelaxWeightValidation's own comment for why this is log-severity only)
+            if (s_relaxWeightValidation) {
+                Logger::warn(L"Weighted mesh variants '{}' and '{}' do not match.",
+                            m_origMeshPath.wstring(),
+                            otherVariantPath.wstring());
+            } else {
+                Logger::error(L"Weighted mesh variants '{}' and '{}' do not match.",
+                              m_origMeshPath.wstring(),
+                              otherVariantPath.wstring());
+            }
         }
 
         // delete from cache to free memory
