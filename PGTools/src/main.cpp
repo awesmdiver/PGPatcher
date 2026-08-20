@@ -215,23 +215,20 @@ void mainRunner(PGToolsCLIArgs& args)
         args.Patch.source = filesystem::absolute(args.Patch.source);
         args.Patch.output = filesystem::absolute(args.Patch.output);
 
-        // NOT switched to BSA-inclusive scanning, unlike `conflicts` below -- REVERTED after live
-        // testing found a real, reproducible indefinite hang. `conflicts` runs patchMeshes with
-        // dryRun=true, which skips the entire `if (!dryRun) { meshTracker.saveMeshes(); ... }` block
-        // in patchNIF (PGPatcher.cpp) -- meaning it never touches PGMeshPermutationTracker::
-        // saveMeshes() or PGGlobals::getFileSaver()'s async write queue at all. `patch` runs with
-        // dryRun=false and DOES exercise that path for real, and once BSA-inclusion roughly doubled
-        // the mesh count (88829 -> 141910 on the director's real install), a real `patch` run hung
-        // indefinitely at "Mesh Patcher Starting..." with zero progress and flatlined CPU (confirmed
-        // twice, including once with PGPatcher's own GUI fully closed to rule out a file-lock
-        // collision). Root cause not fully pinned down -- best working theory is an uncaught exception
-        // in a worker thread somewhere in the real (non-dry-run) save path when it hits a BSA-sourced
-        // mesh, silently stalling TaskPoolRunner's own completion tracking -- but not confirmed with a
-        // debugger. Shipping a `/build` pipeline (vortex-collection-tools' own real output step) that
-        // hangs forever is a far worse regression than the original BSA-exclusion gap, so this half of
-        // the fix is reverted back to its original, working (if BSA-incomplete) behavior. See this
-        // repo's own prompts/handoff-latest.md for the full story and a matching follow-up item.
-        auto pgd = PGDirectory(args.Patch.source, args.Patch.output);
+        // BSA-inclusive scanning RE-ENABLED here after a real investigation (see this repo's own
+        // docs -- vortex-collection-tools/docs/reference-pgpatcher-internals.md has the full story).
+        // This was reverted earlier in the same session after live testing found what looked like an
+        // indefinite hang under multithreading. Root-caused with a debugger: the actual hang was
+        // TaskPoolRunner::runTasks() looping forever after an exception (a plain std::filesystem
+        // "path too long" error, caused by this session's own overlong scratch-folder test output
+        // path, nothing BSA-related) because stop()-ing the pool doesn't unstick tasks that never
+        // started. That bug is now fixed at the source (TaskPoolRunner.cpp) -- any future exception,
+        // from any cause, fails fast and cleanly instead of hanging, so it's safe to restore BSA
+        // inclusion here too. Confirmed live: the real GUI's own build (PGPatcher/src/main.cpp:437)
+        // includes BSA content too, and a real ~2000-mod `patch` run with this restored matched the
+        // GUI's own file count far more closely than the BSA-excluded version ever could.
+        auto bg = BethesdaGame(BethesdaGame::GameType::SKYRIM_SE, args.Patch.source.parent_path());
+        auto pgd = PGDirectory(&bg, args.Patch.output);
         PGGlobals::setPGD(&pgd);
         auto pgd3D = PGD3D(exePath / "cshaders");
         PGGlobals::setPGD3D(&pgd3D);
@@ -263,10 +260,10 @@ void mainRunner(PGToolsCLIArgs& args)
         // delete existing output
         PGPatcher::deleteOutputDir();
 
-        // Init file map -- still BSA-EXCLUDED (false). See the comment on this subcommand's own
-        // PGDirectory construction above for why: BSA-inclusion here hung the real save pipeline
-        // indefinitely on live testing. `conflicts` below gets the real fix; this one doesn't yet.
-        pgd.populateFileMap(false);
+        // Init file map -- BSA-inclusive now too, matching the real GUI. See the comment on this
+        // subcommand's own PGDirectory construction above for the full story on why this was
+        // reverted and then safely restored.
+        pgd.populateFileMap(true);
 
         // Map files -- now applies the real mesh blocklist/allowlist/vanillaBSAList from
         // settings.json (readProcessingSettings's own comment has the full story). This was
@@ -470,9 +467,7 @@ void mainRunner(PGToolsCLIArgs& args)
         pgmm.populateModFileMapVortex(args.Conflicts.source);
 
         // Init file map -- includes BSA-packed files now, matching the real GUI's own behavior
-        // (`patch` above still doesn't -- see that subcommand's own comment for why). This is safe
-        // here because dryRun=true below means saveMeshes()'s real-write path -- the thing that hung
-        // for `patch` -- never runs at all; every mod whose shader config (e.g. a TruePBR
+        // (`patch` above now does too). Every mod whose shader config (e.g. a TruePBR
         // pbrnifpatcher/*.json) ships packed inside a BSA rather than as loose files was previously
         // invisible to conflict detection entirely, and now isn't.
         pgd.populateFileMap(true);
