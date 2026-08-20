@@ -437,6 +437,26 @@ void mainRunner(PGToolsCLIArgs& args)
             args.multithreading, args.Patch.considerAllMeshes, processingSettings.allowedModelRecTypes, true);
         PGPatcher::patchTextures(args.multithreading);
 
+        // Saving plugins / diff JSON -- REQUIRED, confirmed missing entirely until now. This
+        // subcommand never called PGPlugin::savePlugin() or saved ParallaxGen_Diff.json at all, so a
+        // real `patch` run's output directory was always missing PGPatcher.esp/PG_1.esp/PG_2.esp
+        // (whatever new plugin records any patcher created, e.g. new AlternateTextures entries, were
+        // computed in memory and then silently discarded) and ParallaxGen_Diff.json (the per-mesh
+        // CRC32 diff log). Mirrors the real GUI's own finalization exactly (PGPatcher/src/main.cpp:
+        // 661-726) -- wait for the async file-saver queue to finish, bail if nothing was generated,
+        // then save plugins before saving the diff log. PGTools has no --esm-all/--no-esm flags of
+        // its own, so this always uses the GUI's own default (ESMMode::PGPATCHER_ONLY).
+        if (PGGlobals::getFileSaver().isWorking()) {
+            spdlog::info("Waiting for files to finish saving...");
+            PGGlobals::getFileSaver().waitForCompletion();
+        }
+        if (PGPatcher::isOutputEmpty()) {
+            spdlog::warn("Output directory is empty. No files were generated.");
+        } else {
+            spdlog::info("Saving Plugins");
+            PGPlugin::savePlugin(args.Patch.output, PGPlugin::ESMMode::PGPATCHER_ONLY);
+        }
+
         // Finalize step
         if (patcherDefs.contains("particlelightstolp")) {
             PatcherMeshGlobalParticleLightsToLP::finalize();
@@ -459,6 +479,16 @@ void mainRunner(PGToolsCLIArgs& args)
 
             // Move File
             filesystem::copy_file(assetPath, outputPath, filesystem::copy_options::overwrite_existing);
+        }
+
+        // Save diff json -- see the "Saving plugins / diff JSON" comment above for why this is here
+        // at all. Matches the GUI's own ordering (diff JSON saved last, after plugins and the
+        // cubemap asset deploy).
+        const auto diffJSON = PGPatcher::getDiffJSON();
+        if (!diffJSON.empty()) {
+            const filesystem::path diffJSONPath = args.Patch.output / "ParallaxGen_Diff.json";
+            FileUtil::saveJSON(diffJSONPath, diffJSON, true);
+            pgd.addGeneratedFile("ParallaxGen_Diff.json");
         }
 
         const auto endTime = chrono::high_resolution_clock::now();
