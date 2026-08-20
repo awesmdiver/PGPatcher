@@ -397,7 +397,22 @@ void mainRunner(PGToolsCLIArgs& args)
         if (patcherDefs.contains("fixmeshlighting")) {
             meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::getFactory());
         }
-        if (patcherDefs.contains("fixtextureslotcount")) {
+        // Real, confirmed root cause (2026-08-20) of a whole class of the 828 remaining content
+        // mismatches: the real GUI adds this pre-patcher AUTOMATICALLY whenever any real shader
+        // patcher is active (PGPatcher/src/main.cpp:480-484 -- `if (parallax || complexMaterial ||
+        // truePBR)`), not as its own separate user-facing toggle at all. This subcommand instead
+        // treated it as an independent CLI token nobody ever actually passes (neither this session's
+        // own manual tests nor vortex-collection-tools' web route ever included it), so it silently
+        // never ran. Confirmed via a byte-level trace on Skyland AIO's hhdoor01.nif: its original
+        // mesh ships a 6-slot BSShaderTextureSet (nifly's own version-dependent default for non-SSE-
+        // stream NIFs, external/nifly/src/Shaders.cpp:365-374); PatcherMeshPreFixTextureSlotCount
+        // grows any texture set below `SLOT_COUNT` (9) up to exactly 9 slots
+        // (PatcherMeshPreFixTextureSlotCount.cpp:40-44) -- the real GUI's own output has 9, ours had
+        // 6, a 3-slot (12-byte) gap per shape that matched the observed mismatch exactly. Kept the
+        // explicit `fixtextureslotcount` token too, for backward compatibility with any existing
+        // caller that already passes it directly.
+        if (patcherDefs.contains("fixtextureslotcount") || patcherDefs.contains("parallax")
+            || patcherDefs.contains("complexmaterial") || patcherDefs.contains("truepbr")) {
             meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
         }
         if (patcherDefs.contains("parallax")) {
@@ -619,6 +634,14 @@ void mainRunner(PGToolsCLIArgs& args)
         // own dry-run data too, not just in `patch`'s real output.
         meshPatchers.shaderPatchers.emplace(PatcherMeshShaderDefault::getShaderType(),
                                             PatcherMeshShaderDefault::getFactory());
+        // Same real gap as `patch`'s own identical fix above -- this subcommand had ZERO prePatchers
+        // registered at all until now, so its own dry-run conflict/shader data never reflected a
+        // texture-slot-count-fixed mesh either, matching what a real `patch` run (now fixed) would
+        // actually see.
+        if (args.Conflicts.patchers.contains("parallax") || args.Conflicts.patchers.contains("complexmaterial")
+            || args.Conflicts.patchers.contains("truepbr")) {
+            meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
+        }
         if (args.Conflicts.patchers.contains("parallax")) {
             meshPatchers.shaderPatchers.emplace(PatcherMeshShaderVanillaParallax::getShaderType(),
                                                 PatcherMeshShaderVanillaParallax::getFactory());
