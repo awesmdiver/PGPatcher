@@ -3,6 +3,7 @@
 #include "PGGlobals.hpp"
 #include "PGModManager.hpp"
 #include "PGPatcher.hpp"
+#include "PGPlugin.hpp"
 #include "common/BethesdaGame.hpp"
 #include "patchers/PatcherMeshGlobalParticleLightsToLP.hpp"
 #include "patchers/PatcherMeshPostFixSSS.hpp"
@@ -272,6 +273,60 @@ void mainRunner(PGToolsCLIArgs& args)
         // delete existing output
         PGPatcher::deleteOutputDir();
 
+        // Plugin initialization -- REQUIRED for mesh-use detection to work AT ALL. Confirmed missing
+        // from this subcommand entirely until now, and confirmed live (2026-08-20) via a full traced
+        // run: with this missing, PGPlugin::getModelUses() (called from PGDirectory::mapFiles, which
+        // populates nifCache.meshUses -- PGPatcher.cpp:427/434) returns EMPTY for every single mesh in
+        // the game, because the plugin/ESP model-record cache PGPlugin::populateObjs() builds was
+        // simply never populated. That live run: 108,705 meshes scanned, 108,705 hit "no plugin uses"
+        // -- 100%, not a subset. This is *why* forceBasePatch was hardcoded true in the first place
+        // (without it, `patch` would silently write ZERO patched meshes) -- not because PGTools was
+        // being "more thorough" than the GUI's own conservative default, but because it was blind to
+        // plugin data altogether and needed forceBasePatch as a workaround. It also means every mesh
+        // that DOES have real plugin uses was still being patched using only its own base/default
+        // textures (an empty `alternateTextures` map, same as the forced-dummy path) instead of
+        // whatever a plugin's own AlternateTextures override actually specifies -- a much bigger,
+        // more systemic explanation for real content mismatches than the single-mesh mod-priority
+        // finding below. Mirrors the real GUI's own unconditional setup exactly (PGPatcher/src/
+        // main.cpp:370-380, called before its own mod-manager init, same ordering used here).
+        PGPlugin::initialize(bg, exePath);
+        PGPlugin::populateObjs(args.Patch.output / "PGPatcher.esp");
+
+        // Mod manager setup -- REQUIRED for `patch` to make the same mod-priority-aware conflict
+        // resolution decisions the real GUI always makes (PGPatcher/src/main.cpp:820-821 -- this is
+        // unconditional there, every real run, not something the GUI can skip). Confirmed missing
+        // from this subcommand ENTIRELY until now: PGGlobals::isPGMMSet() was false for the whole
+        // `patch` pipeline, so every ShaderPatcherMatch's `mod` field (PGPatcher.cpp's getMatches,
+        // ~line 794 -- only ever set `if (PGGlobals::isPGMMSet())`) stayed null. sortMatches()
+        // (PGPatcher.cpp:193) checks `mod->priority` to pick the winning match on a shader conflict,
+        // but with every match's mod null, it fell straight through to its own final tiebreak --
+        // alphabetical by JSON config path -- silently ignoring mod priority for the ENTIRE real
+        // build pipeline, every single conflict, the whole time. Confirmed as the real, definitive
+        // root cause of a live traced example (chickencarcass.nif, 2026-08-19/20): the CLI picked
+        // "Faultier's PBR Skyrim AIO 4k" (priority 1215, path starts with "faultier's...") over
+        // "Chicken and Chicks PBR" (priority 1258 -- the correct, higher-priority winner, path starts
+        // with "pbrchicken...") purely because of alphabetical ordering, not mod priority at all.
+        // Mirrors `conflicts`' own identical setup below -- `patch` just never had it.
+        auto pgmm = PGModManager(PGModManager::ModManagerType::VORTEX);
+        PGGlobals::setPGMM(&pgmm);
+
+        nlohmann::json patchModJSON;
+        if (!args.Patch.cfgDir.empty()) {
+            const auto modListFile = args.Patch.cfgDir / "modrules.json";
+            if (FileUtil::getJSON(modListFile, patchModJSON)) {
+                pgmm.loadJSON(patchModJSON);
+            } else {
+                spdlog::warn("No existing modrules.json found at {} -- every mod will read as new "
+                             "(default priority), so shader conflicts will not reflect real mod priority.",
+                             modListFile.string());
+            }
+        } else {
+            spdlog::warn("No --cfg-dir given -- mod priority is unavailable, so shader conflicts will "
+                         "fall back to alphabetical tiebreaking instead of respecting mod priority.");
+        }
+
+        pgmm.populateModFileMapVortex(args.Patch.source);
+
         // Init file map -- BSA-inclusive now too, matching the real GUI. See the comment on this
         // subcommand's own PGDirectory construction above for the full story on why this was
         // reverted and then safely restored.
@@ -460,6 +515,14 @@ void mainRunner(PGToolsCLIArgs& args)
         // Deliberately NO deleteOutputDir() call, unlike `patch` above -- this subcommand never
         // writes to output at all (dryRun=true skips the one real disk-write site entirely), so it
         // must absolutely never delete a real prior patch run's output just to compute conflicts.
+
+        // Plugin initialization -- same real gap as `patch`'s own identical block above (see that
+        // comment for the full story): without this, every mesh reads as having zero plugin uses,
+        // so this subcommand's own conflict/shader data would never reflect real plugin-driven
+        // AlternateTextures overrides, just each mesh's own base textures. Mirrors the real GUI's own
+        // unconditional setup exactly (PGPatcher/src/main.cpp:370-380).
+        PGPlugin::initialize(bg, exePath);
+        PGPlugin::populateObjs(args.Conflicts.output / "PGPatcher.esp");
 
         // Mod manager setup -- Vortex only for now. The director's own real install (this
         // subcommand's own test target) is Vortex; MO2 support (PGModManager::populateModFileMapMO2)
