@@ -30,6 +30,10 @@ private:
     inline static std::unordered_set<std::wstring> s_existingMessages;
     inline static std::shared_mutex s_existingMessagesMutex;
 
+    // Snapshot of s_existingMessages taken by markRunStart()
+    inline static std::unordered_set<std::wstring> s_runStartMessages;
+    inline static bool s_runStartMarked = false;
+
     inline static std::shared_mutex s_mtLogLock;
     inline thread_local static std::vector<
         std::pair<spdlog::level::level_enum, std::variant<std::wstring, std::string>>>
@@ -37,15 +41,39 @@ private:
     inline thread_local static bool s_isThreadedBufferActive;
 
     thread_local static std::vector<std::wstring> s_prefixStack;
-    static auto buildPrefixWString() -> std::wstring;
-    static auto buildPrefixString() -> std::string;
+    static std::wstring buildPrefixWString();
+    static std::string buildPrefixString();
 
-    static auto processMessage(const std::wstring& message) -> bool
+public:
+    /**
+     * @brief Callback type for capturing warning/error/critical messages emitted on the current thread.
+     */
+    using MessageCaptureFn = void (*)(spdlog::level::level_enum,
+                                      const std::wstring&);
+
+private:
+    inline thread_local static MessageCaptureFn s_threadMessageCapture = nullptr;
+
+    static void captureMessage(const spdlog::level::level_enum& level,
+                               const std::wstring& message)
+    {
+        if (s_threadMessageCapture)
+            s_threadMessageCapture(level, message);
+    }
+
+    static void captureMessage(const spdlog::level::level_enum& level,
+                               const std::string& message)
+    {
+        if (s_threadMessageCapture)
+            s_threadMessageCapture(level, StringUtil::utf8toUTF16(message));
+    }
+
+    static bool processMessage(const std::wstring& message)
     {
         {
             const std::shared_lock lock(s_existingMessagesMutex);
             if (s_existingMessages.contains(message)) {
-                // don't log anything if already logged
+                // Don't log anything if already logged.
                 return false;
             }
         }
@@ -57,12 +85,9 @@ private:
         }
     }
 
-    template <typename... Args> static auto shouldLogString(const std::wstring& fmt) -> bool
-    {
-        return processMessage(fmt);
-    }
+    template<typename... Args> static bool shouldLogString(const std::wstring& fmt) { return processMessage(fmt); }
 
-    template <typename... Args> static auto shouldLogString(const std::string& fmt) -> bool
+    template<typename... Args> static bool shouldLogString(const std::string& fmt)
     {
         return processMessage(StringUtil::utf8toUTF16(fmt));
     }
@@ -96,10 +121,34 @@ public:
         ~Prefix();
 
         Prefix(const Prefix&) = delete;
-        auto operator=(const Prefix&) -> Prefix& = delete;
+        Prefix& operator=(const Prefix&) = delete;
         Prefix(Prefix&&) = delete;
-        auto operator=(Prefix&&) -> Prefix& = delete;
+        Prefix& operator=(Prefix&&) = delete;
     };
+
+    /**
+     * @brief Remembers the current set of suppressed duplicate messages as the start-of-run baseline.
+     *
+     * Call right before the patching step so a re-run of the patching step (see resetToRunStart()) can log the same
+     * messages again while messages from the preparation phase stay suppressed.
+     */
+    static void markRunStart();
+
+    /**
+     * @brief Restores duplicate suppression to the state captured by markRunStart(), so messages logged during a
+     * previous patching step are logged again when the step is re-run. No-op if markRunStart() was never called.
+     */
+    static void resetToRunStart();
+
+    /**
+     * @brief Sets (or clears with nullptr) a capture callback for the current thread.
+     *
+     * While set, every warning, error, and critical message logged on this thread is passed to the callback before
+     * duplicate suppression and buffering, so the callback sees every message the thread attempted to log.
+     *
+     * @param captureFn Callback to invoke, or nullptr to disable capturing on this thread.
+     */
+    static void setThreadMessageCapture(MessageCaptureFn captureFn);
 
     /**
      * @brief Activates the thread-local buffered logging mode and clears any previous buffer contents.
@@ -124,16 +173,16 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void critical(const std::wstring& fmt,
                          Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::critical, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::critical, resolvedStr);
@@ -150,16 +199,16 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void error(const std::wstring& fmt,
                       Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::err, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::err, resolvedStr);
@@ -176,16 +225,16 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void warn(const std::wstring& fmt,
                      Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::warn, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::warn, resolvedStr);
@@ -202,7 +251,7 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void info(const std::wstring& fmt,
                      Args&&... moreArgs)
     {
@@ -224,7 +273,7 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void debug(const std::wstring& fmt,
                       Args&&... moreArgs)
     {
@@ -246,7 +295,7 @@ public:
      * @param fmt Wide-string fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void trace(const std::wstring& fmt,
                       Args&&... moreArgs)
     {
@@ -268,16 +317,16 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void critical(const std::string& fmt,
                          Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::critical, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::critical, resolvedStr);
@@ -294,16 +343,16 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void error(const std::string& fmt,
                       Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::err, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::err, resolvedStr);
@@ -320,16 +369,16 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void warn(const std::string& fmt,
                      Args&&... moreArgs)
     {
         const std::shared_lock lock(s_mtLogLock);
 
         const auto resolvedStr = fmt::format(fmt::runtime(fmt), std::forward<Args>(moreArgs)...);
-        if (!shouldLogString(resolvedStr)) {
+        captureMessage(spdlog::level::warn, resolvedStr);
+        if (!shouldLogString(resolvedStr))
             return;
-        }
 
         if (s_isThreadedBufferActive) {
             s_curBuffer.emplace_back(spdlog::level::warn, resolvedStr);
@@ -346,7 +395,7 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void info(const std::string& fmt,
                      Args&&... moreArgs)
     {
@@ -368,7 +417,7 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void debug(const std::string& fmt,
                       Args&&... moreArgs)
     {
@@ -390,7 +439,7 @@ public:
      * @param fmt Narrow fmt format string.
      * @param moreArgs Arguments forwarded to fmt::format.
      */
-    template <typename... Args>
+    template<typename... Args>
     static void trace(const std::string& fmt,
                       Args&&... moreArgs)
     {

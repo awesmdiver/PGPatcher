@@ -158,7 +158,7 @@ struct PGProcessingSettings {
     // Defaults to the same real default the GUI itself falls back to (PGConfig::getDefaultParams)
     // when settings.json has no explicit `allowedmodelrecordtypes` key -- matches real GUI behavior
     // for a mod-manager-fresh settings.json, not just an empty set.
-    unordered_set<PGPlugin::ModelRecordType> allowedModelRecTypes = PGPlugin::getDefaultRecTypeSet();
+    unordered_set<PGPlugin::ModelRecordType> allowedModelRecTypes = PGPlugin::defaultRecTypeSet();
     // Read for the same reason as everything else in this struct: so PGTools' own logging level
     // reflects the user's real settings.json (params.processing.enabledebuglogging/
     // enabletracelogging) rather than requiring a separate -v/-vv CLI flag every time, matching how
@@ -200,7 +200,7 @@ auto readProcessingSettings(const filesystem::path& cfgDir) -> PGProcessingSetti
     if (proc.contains("texturemaps")) {
         for (const auto& item : proc["texturemaps"].items()) {
             out.textureMaps.emplace_back(StringUtil::utf8toUTF16(item.key()),
-                                         PGEnums::getTexTypeFromStr(item.value().get<string>()));
+                                         PGEnums::texTypeFromStr(item.value().get<string>()));
         }
     }
     if (proc.contains("vanillabsalist")) {
@@ -210,11 +210,11 @@ auto readProcessingSettings(const filesystem::path& cfgDir) -> PGProcessingSetti
     }
     // Matches PGConfig.cpp's own load logic exactly: only replace the default set if the key is
     // actually present (clear first, same as the GUI's own loader) -- an absent key keeps the
-    // struct's own default (PGPlugin::getDefaultRecTypeSet()), not an empty set.
+    // struct's own default (PGPlugin::defaultRecTypeSet()), not an empty set.
     if (proc.contains("allowedmodelrecordtypes")) {
         out.allowedModelRecTypes.clear();
         for (const auto& item : proc["allowedmodelrecordtypes"]) {
-            out.allowedModelRecTypes.insert(PGPlugin::getRecTypeFromString(item.get<string>()));
+            out.allowedModelRecTypes.insert(PGPlugin::recTypeFromString(item.get<string>()));
         }
     }
     if (proc.contains("enabledebuglogging")) {
@@ -325,7 +325,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // inclusion here too. Confirmed live: the real GUI's own build (PGPatcher/src/main.cpp:437)
         // includes BSA content too, and a real ~2000-mod `patch` run with this restored matched the
         // GUI's own file count far more closely than the BSA-excluded version ever could.
-        auto bg = BethesdaGame(BethesdaGame::GameType::SKYRIM_SE, args.Patch.source.parent_path());
+        auto bg = BethesdaGame(BethesdaGame::GameType::SkyrimSE, args.Patch.source.parent_path());
         auto pgd = PGDirectory(&bg, args.Patch.output);
         PGGlobals::setPGD(&pgd);
         auto pgd3D = PGD3D(exePath / "cshaders");
@@ -349,7 +349,7 @@ void mainRunner(PGToolsCLIArgs& args)
         }
 
         // If output dir is the same as data dir meshes might get overwritten
-        if (filesystem::equivalent(args.Patch.output, pgd.getDataPath())) {
+        if (filesystem::equivalent(args.Patch.output, pgd.dataPath())) {
             spdlog::critical("Output directory cannot be the same directory as your data folder. "
                              "Exiting.");
             exit(1);
@@ -392,7 +392,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // "Chicken and Chicks PBR" (priority 1258 -- the correct, higher-priority winner, path starts
         // with "pbrchicken...") purely because of alphabetical ordering, not mod priority at all.
         // Mirrors `conflicts`' own identical setup below -- `patch` just never had it.
-        auto pgmm = PGModManager(PGModManager::ModManagerType::VORTEX);
+        auto pgmm = PGModManager(PGModManager::ModManagerType::Vortex);
         PGGlobals::setPGMM(&pgmm);
 
         nlohmann::json patchModJSON;
@@ -491,7 +491,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // already there -- either way, checking the real source condition is the only correct test).
         if (patcherDefs.contains("fixtextureslotcount")
             && !(activePatchers.parallax || activePatchers.complexMaterial || activePatchers.truePBR)) {
-            meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::getFactory());
+            meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixTextureSlotCount::factory());
         }
 
         // Caller-specific option-loading and shader-hook initialization -- deliberately NOT part of
@@ -501,7 +501,7 @@ void mainRunner(PGToolsCLIArgs& args)
             PatcherMeshShaderComplexMaterial::loadOptions(patcherDefs["complexmaterial"]);
         }
         if (patcherDefs.contains("truepbr")) {
-            PatcherMeshShaderTruePBR::loadStatics(pgd.getPBRJSONs());
+            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs());
             PatcherMeshShaderTruePBR::loadOptions(patcherDefs["truepbr"]);
         }
         if (patcherDefs.contains("parallaxtocm")) {
@@ -515,14 +515,14 @@ void mainRunner(PGToolsCLIArgs& args)
         // PGPatcher/src/main.cpp, zero references), so it stays here rather than in the shared
         // function, same as before this refactor.
         if (patcherDefs.contains("particlelightstolp")) {
-            meshPatchers.globalPatchers.emplace_back(PatcherMeshGlobalParticleLightsToLP::getFactory());
+            meshPatchers.globalPatchers.emplace_back(PatcherMeshGlobalParticleLightsToLP::factory());
         }
 
         PatcherUtil::PatcherTextureSet texPatchers;
         if (patcherDefs.contains("converttohdr")) {
             PatcherTextureGlobalConvertToHDR::initShader();
 
-            texPatchers.globalPatchers.emplace_back(PatcherTextureGlobalConvertToHDR::getFactory());
+            texPatchers.globalPatchers.emplace_back(PatcherTextureGlobalConvertToHDR::factory());
             PatcherTextureGlobalConvertToHDR::loadOptions(patcherDefs["converttohdr"]);
         }
 
@@ -543,16 +543,16 @@ void mainRunner(PGToolsCLIArgs& args)
         // CRC32 diff log). Mirrors the real GUI's own finalization exactly (PGPatcher/src/main.cpp:
         // 661-726) -- wait for the async file-saver queue to finish, bail if nothing was generated,
         // then save plugins before saving the diff log. PGTools has no --esm-all/--no-esm flags of
-        // its own, so this always uses the GUI's own default (ESMMode::PGPATCHER_ONLY).
-        if (PGGlobals::getFileSaver().isWorking()) {
+        // its own, so this always uses the GUI's own default (ESMMode::PGPatcherOnly).
+        if (PGGlobals::fileSaver().isWorking()) {
             spdlog::info("Waiting for files to finish saving...");
-            PGGlobals::getFileSaver().waitForCompletion();
+            PGGlobals::fileSaver().waitForCompletion();
         }
         if (PGPatcher::isOutputEmpty()) {
             spdlog::warn("Output directory is empty. No files were generated.");
         } else {
             spdlog::info("Saving Plugins");
-            PGPlugin::savePlugin(args.Patch.output, PGPlugin::ESMMode::PGPATCHER_ONLY);
+            PGPlugin::savePlugin(args.Patch.output, PGPlugin::ESMMode::PGPatcherOnly);
         }
 
         // Finalize step
@@ -582,7 +582,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // Save diff json -- see the "Saving plugins / diff JSON" comment above for why this is here
         // at all. Matches the GUI's own ordering (diff JSON saved last, after plugins and the
         // cubemap asset deploy).
-        const auto diffJSON = PGPatcher::getDiffJSON();
+        const auto diffJSON = PGPatcher::diffJSON();
         if (!diffJSON.empty()) {
             const filesystem::path diffJSONPath = args.Patch.output / "ParallaxGen_Diff.json";
             FileUtil::saveJSON(diffJSONPath, diffJSON, true);
@@ -612,7 +612,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // Same real-BethesdaGame requirement as `patch` above -- see that block's own comment for
         // the full reasoning (BSA inclusion needs a real m_bg, the raw-path constructor always left
         // it null).
-        auto bg = BethesdaGame(BethesdaGame::GameType::SKYRIM_SE, args.Conflicts.source.parent_path());
+        auto bg = BethesdaGame(BethesdaGame::GameType::SkyrimSE, args.Conflicts.source.parent_path());
         auto pgd = PGDirectory(&bg, args.Conflicts.output);
         PGGlobals::setPGD(&pgd);
         auto pgd3D = PGD3D(exePath / "cshaders");
@@ -635,7 +635,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // Creating an empty directory is harmless even though nothing ever gets written inside it.
         filesystem::create_directories(args.Conflicts.output);
 
-        if (filesystem::equivalent(args.Conflicts.output, pgd.getDataPath())) {
+        if (filesystem::equivalent(args.Conflicts.output, pgd.dataPath())) {
             spdlog::critical("Output directory cannot be the same directory as your data folder. Exiting.");
             exit(1);
         }
@@ -657,7 +657,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // is a real, cheap follow-up but wasn't wired up here since there's no real MO2 install to
         // verify it against, and this task's own instruction is to test against real data before
         // committing, not ship an unverified code path.
-        auto pgmm = PGModManager(PGModManager::ModManagerType::VORTEX);
+        auto pgmm = PGModManager(PGModManager::ModManagerType::Vortex);
         PGGlobals::setPGMM(&pgmm);
 
         nlohmann::json modJSON;
@@ -713,7 +713,7 @@ void mainRunner(PGToolsCLIArgs& args)
             PatcherMeshShaderComplexMaterial::loadOptions(complexMaterialOptions);
         }
         if (args.Conflicts.patchers.contains("truepbr")) {
-            PatcherMeshShaderTruePBR::loadStatics(pgd.getPBRJSONs());
+            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs());
             unordered_map<string, string> truePBROptions;
             PatcherMeshShaderTruePBR::loadOptions(truePBROptions);
         }
@@ -741,7 +741,7 @@ void mainRunner(PGToolsCLIArgs& args)
         // meshesignored only -- used elsewhere for a different real purpose, deliberately not reused
         // here).
         auto result = nlohmann::json::array();
-        for (const auto& mod : pgmm.getModsByPriority()) {
+        for (const auto& mod : pgmm.modsByPriority()) {
             auto modJson = nlohmann::json::object();
             modJson["name"] = StringUtil::utf16toUTF8(mod->name);
             modJson["isNew"] = mod->isNew;
@@ -752,7 +752,7 @@ void mainRunner(PGToolsCLIArgs& args)
 
             auto shaders = nlohmann::json::array();
             for (const auto& shader : mod->shaders) {
-                shaders.push_back(PGEnums::getStrFromShader(shader));
+                shaders.push_back(PGEnums::strFromShader(shader));
             }
             modJson["shaders"] = shaders;
 

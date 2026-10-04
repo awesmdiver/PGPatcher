@@ -1,17 +1,59 @@
 # Changelog
 
-## [1.3.0] - UNRELEASED
+## [Unreleased]
 
-- GUI now follows the system light/dark theme by default (--force-light and --force-dark still override)
-- Fixed message box popups and the completion dialog collapse arrows not rendering in dark mode
-- Removed the ESMify Plugin option from the launcher, replaced by the --esm-all CLI argument
-- Added --no-esm CLI argument to disable the ESM flag on PGPatcher.esp
+- Fixed PBR shader not removing Facegen_RGB_Tint flag if exists
+- Fixed alternate textures on skin tint shapes being patched (they are ignored in vanilla)
+- Updated French localization (cl3mus)
+
+## [2.1.0] - 2026-09-15
+
+- Added DPI awareness for all GUI components
+- All windows now show the PGPatcher icon in their title bar
+- Removed restriction that prevents grass meshes from being patched for PBR (CS will now support PBR grass)
+- Removed restriction that prevents rgb tint flag shapes from being patched for PBR
+- Changed layout of config buttons in the launcher window
+- Fixed restore defaults/load config logic mismatching with enable state of save config button
+- Fixed some strings not in the localization files
+- Fixed some cases of exceptions causing hangs in multithreaded context
+- Updated Russian localization with new strings (enbl1tenment)
+- Added Chinese simplified localization (LoyiNuts)
+- Added French localization (cl3mus)
+
+## [2.0.0] - 2026-09-10
+
+- Added "Update Output" button to the launcher which will be available if your output location has a previous output with a cache in it
+- Added --autostart-update CLI argument, which updates the previous output like the "Update Output" button (--autostart keeps regenerating from scratch)
+- The conflict manager's "Save Changes and Update Output" now only re-patches meshes affected by the changed mod order or mod state
+- Improved plugin patching performance by copying records only when a mesh actually changes them (lazy loading)
+- Added support for relative game paths in modorganizer.ini
+- Added support for relative paths for MO2 instance location, game path, and output path
+- PBR json fields will now be validated by data type. Fields with wrong type will be silently ignored.
+- Added Turkish localization (khanblood007)
+- Added Russian localization (enbl1tenment)
+- Fixed warnings and errors of the previous patching step not being shown again after re-running from the conflict manager
+- Fixed some labels being cut off in dialogs for certain translations
+- Fixed pgtools dynamic cubemap file copy exception
+- Fixed pgtools --no-multithreading CLI argument not behaving correctly
+- BREAKING CHANGE Removed the "pbr" PBR json field
+- BREAKING CHANGE Removed the "env_mapping", "env_map_scale", and "env_map_scale_mult" PBR json fields
+
+## [1.3.0] - 2026-08-31
+
+- GUI now follows the system light/dark theme by default, theme can be set from the new settings dialog
+- Mistmatch warnings no longer appear, instead the conflict viewer has an option to show potential conflicts
 - Added GUI localization system with JSON translation files in the "translations" folder, selectable via the new settings (gear) button in the launcher
+- Added "Highlight New Mods" checkbox to the conflict manager
+- Added --no-esm CLI argument to disable the ESM flag on PGPatcher.esp
+- Removed the ESMify Plugin option from the launcher, replaced by the --esm-all CLI argument
+- Removed --force-light and --force-dark (replaced by GUI setting)
+- Changed wording for some GUI strings
 - Fixed broken wiki link in conflict manager
-- Change wording in output settings
-- Change wording in mod manager settings
+- Fixed message box popups and the completion dialog collapse arrows not rendering in dark mode
+- Fixed weight mismatch error showing when weighted mesh was used in both weighted and non-weighted contexts
+- Fixed conflict manager always reporting unsaved changes after a run even when nothing was changed
 
-## [1.2.0] - UNRELEASED
+## [1.2.0] - 2026-07-21
 
 - Added Conflict viewer dialog to see any matching conflicts
 - Conflict manager will no longer appear during patching, it is accessible from the completion dialog

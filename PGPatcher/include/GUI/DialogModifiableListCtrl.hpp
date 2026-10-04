@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GUI/components/PGModifiableListCtrl.hpp"
+#include "GUI/components/PGWrappingStaticText.hpp"
 
 #include <wx/listctrl.h>
 #include <wx/wx.h>
@@ -13,12 +14,12 @@
  *
  * Presents a resizable dialog with an instruction label, an editable single-column
  * list control, and OK/Cancel buttons. Items can be pre-populated via populateList()
- * and retrieved after the dialog is accepted via getList().
+ * and retrieved after the dialog is accepted via list().
  */
 class DialogModifiableListCtrl : public wxDialog {
 private:
     PGModifiableListCtrl* m_listCtrl;
-    wxStaticText* m_helpText;
+    PGWrappingStaticText* m_helpText;
 
 public:
     /**
@@ -37,7 +38,7 @@ public:
      *
      * @return Vector of wide strings representing each list entry.
      */
-    [[nodiscard]] auto getList() const -> std::vector<std::wstring>;
+    [[nodiscard]] std::vector<std::wstring> list() const;
 
     /**
      * @brief Populate the list control with the provided items.

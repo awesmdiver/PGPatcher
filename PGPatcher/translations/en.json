@@ -15,6 +15,13 @@
     "language": {
       "label": "Language",
       "tooltip": "Languages are read from the \"translations\" folder"
+    },
+    "theme": {
+      "label": "Theme",
+      "light": "Light",
+      "dark": "Dark",
+      "system": "System",
+      "tooltip": "\"System\" follows the Windows theme. Applied when the launcher restarts."
     }
   },
   "launcher": {
@@ -49,8 +56,8 @@
     "output": {
       "title": "Output",
       "location": {
-        "help": "Location recommended to be a mod folder. Cannot be in your data folder. Avoid deleting old output before running if output is set to a mod folder.",
-        "tooltip": "Path to the output folder - This folder should be used EXCLUSIVELY for PGPatcher"
+        "help": "Location",
+        "tooltip": "Path to the output folder - This folder should be used EXCLUSIVELY for PGPatcher, recommended to be a mod folder"
       },
       "zip": {
         "label": "Zip Output (Keep disabled if outputting to a mod folder)",
@@ -107,7 +114,10 @@
       "restoreDefaults": "Restore Defaults",
       "loadConfig": "Load Config",
       "saveConfig": "Save Config",
-      "startPatching": "Start Patching"
+      "startPatching": "Start Patching",
+      "startPatchingTooltip": "Generate the output from scratch (any previous output in the output location is replaced)",
+      "updateOutput": "Update Output",
+      "updateOutputTooltip": "Update the previous output in the output location: only meshes whose inputs changed since that output was generated are patched again. Available when the output location contains a previous output and zip output is disabled."
     },
     "processing": {
       "title": "Processing",
@@ -145,6 +155,24 @@
     "confirmRestoreDefaults": {
       "title": "Confirm Restore Defaults",
       "message": "Are you sure you want to restore the default settings? This action cannot be undone."
+    },
+    "validation": {
+      "gameLocationRequired": "Game Location is required",
+      "gameLocationInvalid": "Game Location is not valid. Verify your game type and location are correct.",
+      "mo2RelativeGamePath": "Unable to resolve the relative game path from MO2 - make sure you launched PGPatcher from MO2",
+      "mo2InstanceRequired": "MO2 Instance Location is required",
+      "mo2InstanceMissing": "MO2 Instance Location does not exist",
+      "mo2InstanceInvalid": "MO2 Instance Location is not valid. Verify modorganizer.ini exists in the directory.",
+      "outputLocationRequired": "Output Location is required",
+      "parallaxToCMRequiresPatchers": "Upgrade Parallax to Complex Material requires both the Complex Material and Parallax shader patchers",
+      "meshAllowListEmptyEntry": "Empty entry in Mesh Allow List",
+      "meshAllowListDuplicate": "Duplicate entry in Mesh Allow List: %s",
+      "meshBlockListEmptyEntry": "Empty entry in Mesh Block List",
+      "meshBlockListDuplicate": "Duplicate entry in Mesh Block List: %s",
+      "textureRulesEmptyKey": "Empty key in Texture Rules",
+      "textureRulesDuplicate": "Duplicate entry in Texture Rules: %s",
+      "vanillaBSAListEmptyEntry": "Empty entry in Vanilla BSA List",
+      "vanillaBSAListDuplicate": "Duplicate entry in Vanilla BSA List: %s"
     }
   },
   "dialogs": {
@@ -193,6 +221,7 @@
       "savingPlugins": "Saving Plugins",
       "deployingAssets": "Deploying Assets",
       "savingDiffJson": "Saving Diff Json",
+      "savingUpdateCache": "Saving Update Cache",
       "creatingZipArchive": "Creating Zip Archive"
     }
   },
@@ -237,6 +266,10 @@
     "search": {
       "label": "Search:",
       "hint": "Search mods by name..."
+    },
+    "highlightNewMods": {
+      "label": "Highlight New Mods",
+      "tooltip": "Highlight mods that PGPatcher is seeing for the first time"
     },
     "winningModsOnTop": "Winning Mods on Top",
     "losingModsOnBottom": "Losing Mods on Bottom",
@@ -287,6 +320,8 @@
     },
     "showDisabledMods": "Show Disabled Mods",
     "onlyShowConflicts": "Only Show Conflicts",
+    "showMismatches": "Show Potential Mismatches",
+    "showMismatchesTooltip": "Show warning icons for meshes and matches with potential mod mismatches",
     "panels": {
       "meshes": "Meshes",
       "shapes": "Shapes",
@@ -306,6 +341,22 @@
     "unnamedShape": "[ Unnamed ]",
     "noMatches": "[No matches - this shape cannot be patched]",
     "untrackedMod": "[Untracked Mod/Vanilla]",
+    "warnings": {
+      "meshFromOtherMod": "Mesh is from %s, verify UVs match",
+      "resultTexturesFromDifferentMods": "Resultant textures come from multiple mods, verify this is correct:"
+    },
+    "slots": {
+      "diffuse": "Diffuse",
+      "normal": "Normal",
+      "glow": "Glow",
+      "parallax": "Parallax",
+      "cubemap": "Cubemap",
+      "envMask": "Environment Mask",
+      "multilayer": "Multilayer",
+      "backlight": "Backlight",
+      "unused": "Unused",
+      "unknown": "Unknown"
+    },
     "contextMenu": {
       "copyName": "Copy Name",
       "open": "Open",

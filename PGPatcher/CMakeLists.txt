@@ -23,6 +23,9 @@ add_executable(${EXE_NAME} WIN32
     ${HEADERS}
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.rc
     ${CMAKE_CURRENT_BINARY_DIR}/resources/meta.rc
+    # Declares the process DPI aware (see the file). CMake passes .manifest sources of an executable to mt.exe, which
+    # merges them into the manifest embedded at link time; this works with every generator (Ninja included)
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/PGPatcher.manifest
 )
 
 #
@@ -49,7 +52,16 @@ endif()
 #
 # Assets
 #
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/assets DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/)
-file(GLOB RESOURCE_GIFS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/resources/*.gif)
-file(COPY ${RESOURCE_GIFS} DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/resources/)
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/translations DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/)
+# Copy at build time (not configure time) so edits to these files land in the output
+# directory on every build without needing a CMake reconfigure
+file(GLOB RESOURCE_FILES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/*.gif
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/*.svg)
+add_custom_target(${EXE_NAME}_data ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${CMAKE_CURRENT_SOURCE_DIR}/assets ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${CMAKE_CURRENT_SOURCE_DIR}/translations ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/translations
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/resources
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RESOURCE_FILES} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/resources
+    VERBATIM
+)
+add_dependencies(${EXE_NAME} ${EXE_NAME}_data)

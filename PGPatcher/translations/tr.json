@@ -1,0 +1,375 @@
+{
+  "_language": "Türkçe",
+  "common": {
+    "browse": "Gözat",
+    "cancel": "İptal",
+    "ok": "Tamam",
+    "close": "Kapat",
+    "errors": "Hatalar",
+    "error": "Hata",
+    "enable": "Etkinleştir",
+    "disable": "Devre Dışı Bırak"
+  },
+  "settings": {
+    "title": "Ayarlar",
+    "language": {
+      "label": "Dil",
+      "tooltip": "Diller \"translations\" klasöründen okunur"
+    },
+    "theme": {
+      "label": "Tema",
+      "light": "Açık",
+      "dark": "Koyu",
+      "system": "Sistem",
+      "tooltip": "\"Sistem\" seçeneği Windows temasını takip eder. Başlatıcı yeniden başlatıldığında uygulanır."
+    }
+  },
+  "launcher": {
+    "title": "PGPatcher %s Başlatıcı",
+    "settingsButton": {
+      "tooltip": "PGPatcher ayarlarını aç"
+    },
+    "helpButton": {
+      "tooltip": "PGPatcher wiki sayfasını aç"
+    },
+    "game": {
+      "title": "Oyun",
+      "location": {
+        "label": "Konum",
+        "tooltip": "Oyun klasörünün yolu (data klasörü DEĞİL)"
+      },
+      "type": {
+        "label": "Tür"
+      }
+    },
+    "modManager": {
+      "title": "Mod Yöneticisi",
+      "noneSuffix": " (Çakışma Çözümü Yok)"
+    },
+    "mo2Options": {
+      "title": "MO2 Seçenekleri",
+      "instanceLocation": {
+        "label": "MO2 Kurulum Klasörü",
+        "tooltip": "MO2 kurulum klasörünün yolu (Klasör Simgesi > MO2'de Instance Klasörünü Aç)"
+      }
+    },
+    "output": {
+      "title": "Çıktı",
+      "location": {
+        "help": "Konum",
+        "tooltip": "Çıktı klasörünün yolu - Bu klasör SADECE PGPatcher için kullanılmalıdır, bir mod klasörü olması önerilir"
+      },
+      "zip": {
+        "label": "Çıktıyı Zip'le (Bir mod klasörüne çıktı alıyorsanız devre dışı bırakın)",
+        "tooltip": "İşlem sonrası çıktı klasörünü zip'ler"
+      },
+      "pluginLang": {
+        "label": "Eklenti Dili",
+        "placeholder": "Dil",
+        "tooltip": "Çıktı eklentisindeki gömülü metinlerin dili. Bir kayıt için bu dilde çeviri yoksa, genellikle İngilizce olan varsayılan dil kullanılır."
+      }
+    },
+    "prePatchers": {
+      "title": "Ön Yamalayıcılar",
+      "fixMeshLighting": {
+        "label": "Mesh Aydınlatmasını Düzelt (Yalnızca ENB)",
+        "tooltip": "Parlayan mesh'leri düzeltir (Yalnızca ENB kullanıcıları için!)"
+      }
+    },
+    "shaderPatchers": {
+      "title": "Shader Yamalayıcıları",
+      "parallax": {
+        "label": "Parallax"
+      },
+      "complexMaterial": {
+        "label": "Complex Material"
+      },
+      "truePBR": {
+        "label": "TruePBR (Yalnızca CS)"
+      }
+    },
+    "shaderTransforms": {
+      "title": "Shader Dönüşümleri",
+      "parallaxToCM": {
+        "label": "Parallax'ı Complex Material'e Yükselt",
+        "tooltip": "Uyumluluk için gerektiğinde parallax dokularını ve mesh'lerini complex material'e yükseltir (şiddetle tavsiye edilir)"
+      }
+    },
+    "postPatchers": {
+      "title": "Son Yamalayıcılar",
+      "disablePrePatchedMaterials": {
+        "label": "Önceden Yamalanmış Materyalleri Devre Dışı Bırak",
+        "tooltip": "Parallax veya complex material dokuları eksikse shader'ları varsayılana döndürür (şiddetle tavsiye edilir, otomatik parallax işlevinin yerini alır)"
+      },
+      "fixSSS": {
+        "label": "Orijinal Subsurface Scattering'i Düzelt",
+        "tooltip": "Mesh'lerdeki, özellikle bitki örtüsündeki subsurface scattering sorunlarını düzeltir"
+      },
+      "hairFlowMap": {
+        "label": "Saç Flow Map Ekle (Yalnızca CS)",
+        "tooltip": "Normal dokusuyla eşleşen doku setlerine flow map ekler"
+      }
+    },
+    "buttons": {
+      "restoreDefaults": "Varsayılanlara Sıfırla",
+      "loadConfig": "Yapılandırma Yükle",
+      "saveConfig": "Yapılandırma Kaydet",
+      "startPatching": "Yamalamayı Başlat"
+    },
+    "processing": {
+      "title": "İşleme",
+      "help": "Bu seçenekler çıktı oluşturmayı özelleştirmek için kullanılır. Ne yaptığınızı bilmiyorsanız bunları değiştirmekten kaçının.",
+      "allowedRecordTypes": "İzin Verilen Kayıt Türleri",
+      "meshAllowlist": "Mesh İzin Listesi",
+      "meshBlocklist": "Mesh Engel Listesi",
+      "textureRules": "Doku Kuralları",
+      "multithreading": {
+        "label": "Çoklu İş Parçacığı",
+        "tooltip": "Daha fazla kaynak kullanma pahasına çalışma süresini hızlandırır"
+      },
+      "devMode": {
+        "label": "Mod Geliştirici Modunu Etkinleştir",
+        "tooltip": "PGPatcher ile çalışan mod geliştiricilerine yardımcı olacak bazı uyarıları etkinleştirir"
+      },
+      "debugLogging": {
+        "label": "Hata Ayıklama Günlüğünü Etkinleştir",
+        "tooltip": "Çıktı günlüğünde hata ayıklama kaydını etkinleştirir"
+      },
+      "traceLogging": {
+        "label": "İzleme Günlüğünü Etkinleştir",
+        "tooltip": "Çıktı günlüğünde izleme kaydını etkinleştirir (çok ayrıntılı)"
+      }
+    },
+    "browse": {
+      "gameLocation": "Oyun Konumunu Seç",
+      "mo2InstanceLocation": "MO2 Instance Konumunu Seç",
+      "outputLocation": "Çıktı Konumunu Seç"
+    },
+    "confirmLoadConfig": {
+      "title": "Yapılandırma Yüklemeyi Onayla",
+      "message": "Yapılandırmayı dosyadan yüklemek istediğinizden emin misiniz? Bu işlem, kaydedilmemiş tüm mevcut ayarların üzerine yazacaktır."
+    },
+    "confirmRestoreDefaults": {
+      "title": "Varsayılanlara Sıfırlamayı Onayla",
+      "message": "Varsayılan ayarları geri yüklemek istediğinizden emin misiniz? Bu işlem geri alınamaz."
+    }
+  },
+  "dialogs": {
+    "meshAllowlist": {
+      "title": "Mesh Kuralları İzin Listesi",
+      "description": "Burada herhangi bir kural varsa, yalnızca bunlarla eşleşen mesh'ler yamalanır. \"meshes/armor/helmet.nif\" gibi mesh yolu girin veya tüm klasörleri/dosyaları izin listesine eklemek için joker karakter (* joker karakterdir) kullanın. Giriş eklemek/kaldırmak için sağ tıklayın."
+    },
+    "meshBlocklist": {
+      "title": "Mesh Kuralları Engel Listesi",
+      "description": "Buradaki kurallarla eşleşen mesh'ler yamalanmayacaktır. \"meshes/armor/helmet.nif\" gibi mesh yolu girin veya tüm klasörleri/dosyaları engel listesine eklemek için joker karakter (* joker karakterdir) kullanın. Giriş eklemek/kaldırmak için sağ tıklayın."
+    },
+    "textureRules": {
+      "title": "Doku Kuralları",
+      "description": "Otomatik algılama yanlışsa (çok nadir), PGPatcher'a bir şeyin ne tür bir doku olduğunu söylemek için bunu kullanın. \"textures/armor/helmet.dds\" gibi dokunun tam yolunu girin ve doku türünü seçin. Joker karakterler burada DESTEKLENMEZ. Bir doku, türü \"unknown\" olarak ayarlanarak yok sayılabilir. Giriş eklemek/kaldırmak için sağ tıklayın."
+    },
+    "recTypeSelector": {
+      "title": "İzin Verilen Kayıt Türleri",
+      "description": "Bir kayıt türünün işaretini kaldırmak, onu ve ilişkili mesh'lerini yamalamadan hariç tutar. Yalnızca modeli olan kayıt türleri gösterilir."
+    }
+  },
+  "progress": {
+    "title": "PGPatcher Oluşturma İlerlemesi",
+    "overall": "Genel İlerleme:",
+    "stopButton": "Oluşturmayı Durdur / Çık",
+    "steps": {
+      "preparing": "Hazırlanıyor",
+      "initGpu": "GPU Başlatılıyor",
+      "outputDir": "Çıktı klasörü oluşturuluyor ve doğrulanıyor",
+      "validatingPlugins": "Eklentiler doğrulanıyor",
+      "initPluginPatching": "Eklenti yamalama başlatılıyor",
+      "initModManager": "Mod yöneticisi başlatılıyor",
+      "populatingFileMap": "Dosya haritası dolduruluyor",
+      "validatingDataFiles": "Veri dosyaları doğrulanıyor",
+      "initPatchers": "Yamalayıcılar başlatılıyor",
+      "waitPluginInit": "Eklenti başlatılması bekleniyor",
+      "waitModManagerInit": "Mod yöneticisi başlatılması bekleniyor",
+      "loadingMeshes": "Mesh'ler yükleniyor",
+      "readingNifs": "NIF'ler okunuyor",
+      "classifyingTextures": "Dokular sınıflandırılıyor",
+      "patchingMeshes": "Mesh'ler yamalanıyor",
+      "processingNifs": "NIF'ler işleniyor",
+      "patchingTextures": "Dokular yamalanıyor",
+      "processingTextures": "Dokular işleniyor",
+      "finalizing": "Sonlandırılıyor",
+      "finishingWritingFiles": "Dosya yazımı tamamlanıyor",
+      "savingPlugins": "Eklentiler kaydediliyor",
+      "deployingAssets": "Varlıklar dağıtılıyor",
+      "savingDiffJson": "Diff Json kaydediliyor",
+      "creatingZipArchive": "Zip Arşivi oluşturuluyor"
+    }
+  },
+  "completion": {
+    "title": "PGPatcher Oluşturma Tamamlandı",
+    "message": "PGPatcher çıktı oluşturmayı tamamladı.\n\nİşlem Süresi: %lld saniye\nÇıktı Konumu:\n%s",
+    "showWarnings": "Uyarıları Göster",
+    "showWarningsCount": "Uyarıları Göster (%d)",
+    "showErrors": "Hataları Göster",
+    "showErrorsCount": "Hataları Göster (%d)",
+    "showIgnoredWarnings": "Yok Sayılan Uyarıları Göster",
+    "conflictManager": "Çakışma Yöneticisi",
+    "helpButton": {
+      "tooltip": "PGPatcher Hata Mesajı wiki sayfasını aç"
+    },
+    "openOutputLocation": "Çıktı Konumunu Aç",
+    "openLogFile": "Günlük Dosyasını Aç"
+  },
+  "conflictManager": {
+    "title": "Çakışma Yöneticisi",
+    "help": "PGPatcher'ın mesh'leri nerede hangi mod ile yamalayacağını belirlemek için modlarınızı sıralayın. Mod seçmek çakışmaları gösterecektir. Seçtiğiniz mod, yeşil olan modlara karşı kazanır ve kırmızı olan modlara karşı kaybeder.",
+    "helpButton": {
+      "tooltip": "PGPatcher Mod Penceresi wiki sayfasını aç"
+    },
+    "columns": {
+      "mod": "Mod",
+      "shader": "Shader"
+    },
+    "contextMenu": {
+      "showConflicts": "Çakışmaları Göster...",
+      "showMatches": "Eşleşmeleri Göster...",
+      "openModFolder": "Mod Klasörünü Aç"
+    },
+    "showAllMeshes": {
+      "label": "Tüm Mesh'leri Göster",
+      "tooltip": "Çakışma olsun ya da olmasın tüm mesh'leri, şekilleri ve eşleşmeleri görüntüle"
+    },
+    "lockMO2Order": {
+      "label": "MO2 Loose Dosya Sırasına Kilitle",
+      "tooltip": "Sırayı MO2'ye kilitler. Etkinleştir/devre dışı bırak yine de kullanılabilir. PG çakışmalarının loose dosya çakışmalarıyla aynı olmadığını unutmayın."
+    },
+    "search": {
+      "label": "Ara:",
+      "hint": "Modları isme göre ara..."
+    },
+    "highlightNewMods": {
+      "label": "Yeni Modları Vurgula",
+      "tooltip": "PGPatcher'ın ilk kez gördüğü modları vurgular"
+    },
+    "winningModsOnTop": "Kazanan Modlar Üstte",
+    "losingModsOnBottom": "Kaybeden Modlar Altta",
+    "restoreDefaultOrder": {
+      "label": "Varsayılan Sırayı Geri Yükle",
+      "tooltip": "MO2 için varsayılan sıra loose dosya sıranızdır. Vortex için varsayılan sıra önce shader'a, sonra alfabetik olarak isme göredir."
+    },
+    "buttons": {
+      "saveAndUpdateOutput": "Değişiklikleri Kaydet ve Çıktıyı Güncelle",
+      "discardChanges": "Değişiklikleri Yoksay",
+      "apply": "Uygula",
+      "okay": "Tamam"
+    },
+    "confirmUnsavedChanges": {
+      "title": "Kaydedilmemiş Değişiklikler",
+      "message": "Kaydedilmemiş değişiklikleriniz var, kapatmak istediğinizden emin misiniz?"
+    },
+    "confirmRestoreDefaultOrder": {
+      "title": "Varsayılan Sırayı Geri Yüklemeyi Onayla",
+      "message": "Varsayılan mod sırasını geri yüklemek ve manuel olarak devre dışı bırakılan modları etkinleştirmek istediğinizden emin misiniz?"
+    },
+    "confirmRerunPatching": {
+      "title": "Yamalamayı Yeniden Çalıştır",
+      "message": "Yamalama adımını yeniden çalıştırmak istediğinizden emin misiniz?"
+    },
+    "confirmDiscardChanges": {
+      "title": "Değişiklikleri Yoksaymayı Onayla",
+      "message": "Tüm değişiklikleri yoksaymak istediğinizden emin misiniz?"
+    },
+    "errors": {
+      "saveModConfig": "Mod yapılandırması modrules.json dosyasına kaydedilemedi",
+      "saveUserConfig": "Kullanıcı yapılandırması user.json dosyasına kaydedilemedi"
+    }
+  },
+  "matchViewer": {
+    "title": "Eşleşme Görüntüleyici",
+    "filterLabel": {
+      "allConflicts": "Tüm çakışmalar gösteriliyor",
+      "conflictsForMod": "Şu mod için çakışmalar gösteriliyor: %s",
+      "conflictsBetweenMods": "Şu modlar arasındaki çakışmalar gösteriliyor: %s",
+      "allMatches": "Tüm eşleşmeler gösteriliyor",
+      "matchesForMod": "Şu mod için eşleşmeler gösteriliyor: %s",
+      "matchesForMods": "Şu modlar için eşleşmeler gösteriliyor: %s"
+    },
+    "search": {
+      "label": "Ara:",
+      "hint": "Mesh yoluna göre ara..."
+    },
+    "showDisabledMods": "Devre Dışı Modları Göster",
+    "onlyShowConflicts": "Yalnızca Çakışmaları Göster",
+    "showMismatches": "Olası Uyumsuzlukları Göster",
+    "showMismatchesTooltip": "Olası mod uyumsuzluğu olan mesh'ler ve eşleşmeler için uyarı simgeleri göster",
+    "panels": {
+      "meshes": "Mesh'ler",
+      "shapes": "Şekiller",
+      "matches": "Eşleşmeler"
+    },
+    "columns": {
+      "meshPath": "Mesh Yolu",
+      "shape": "Şekil",
+      "mod": "Mod",
+      "shader": "Shader",
+      "matchedFile": "Eşleşen Dosya"
+    },
+    "pluginUse": {
+      "label": "Eklenti Kullanımına Göre Filtrele:",
+      "noneSelected": "(Eklenti Kullanımı Seçilmedi)"
+    },
+    "unnamedShape": "[ İsimsiz ]",
+    "noMatches": "[Eşleşme yok - bu şekil yamalanamaz]",
+    "untrackedMod": "[Takip Edilmeyen Mod/Orijinal Oyun]",
+    "warnings": {
+      "meshFromOtherMod": "Mesh %s modundan geliyor, UV'lerin eşleştiğini doğrulayın",
+      "resultTexturesFromDifferentMods": "Sonuç dokuları birden fazla moddan geliyor, bunun doğru olduğunu doğrulayın:"
+    },
+    "slots": {
+      "diffuse": "Diffuse",
+      "normal": "Normal",
+      "glow": "Parlama",
+      "parallax": "Parallax",
+      "cubemap": "Cubemap",
+      "envMask": "Ortam Maskesi",
+      "multilayer": "Çok Katmanlı",
+      "backlight": "Arka Işık",
+      "unused": "Kullanılmıyor",
+      "unknown": "Bilinmiyor"
+    },
+    "contextMenu": {
+      "copyName": "İsmi Kopyala",
+      "open": "Aç",
+      "copyModName": "Mod İsmini Kopyala",
+      "openModFolder": "Mod Klasörünü Aç",
+      "openMatchingFile": "Eşleşen Dosyayı Aç"
+    },
+    "extraction": {
+      "title": "Dosya Çıkarma",
+      "message": "Bu dosya bir BSA arşivinin içinde:\n%s\n\nSalt okunur bir geçici konuma çıkarıp açmak ister misiniz? Bu pencereyi kapattığınızda silinecektir.",
+      "errorTitle": "Çıkarma Hatası",
+      "readFailed": "Hata: Dosya okunamadı.",
+      "createTempFailed": "Hata: %s konumunda geçici dosya oluşturulamadı",
+      "fileTooLarge": "Hata: Dosya çıkarmak için çok büyük.",
+      "extractOpenFailed": "Dosya çıkarılıp açılmaya çalışılırken hata oluştu: %s"
+    },
+    "errors": {
+      "dataDirUnavailable": "Dosya açılamıyor: veri klasörü kullanılamıyor.",
+      "deleteTempFailed": "Geçici dosya silinemedi %s: %s"
+    }
+  },
+  "components": {
+    "modifiableList": {
+      "add": "Ekle",
+      "remove": "Kaldır"
+    },
+    "logMessageList": {
+      "ignore": "Yoksay",
+      "unignore": "Yoksaymayı Kaldır"
+    },
+    "checkedDragList": {
+      "moveToTop": "En Üste Taşı",
+      "moveToBottom": "En Alta Taşı",
+      "patchMeshes": "Mesh'leri Yamala",
+      "ignoreMeshes": "Mesh'leri Yoksay"
+    }
+  }
+}

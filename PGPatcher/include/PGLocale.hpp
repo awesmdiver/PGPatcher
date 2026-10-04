@@ -18,8 +18,10 @@
  * language selector. Placeholders use printf-style formatting (e.g. %s) and are substituted with wxString::Format at
  * the call site.
  *
- * Every lookup carries a hardcoded English default which is returned when the key is missing from the active
- * translation (or when no translation file is loaded at all), so English is the built-in fallback language.
+ * No user-facing string is hardcoded in C++. "en.json" is always loaded first as the fallback layer and the active
+ * language is merged on top of it, so any key a translation lacks (or leaves empty) shows the English text. If a key
+ * exists in neither file (which can only happen when the translations folder is missing or broken, i.e. a broken
+ * install), the lookup key itself is shown so the problem is visible instead of silently masked.
  */
 class PGLocale {
 public:
@@ -31,8 +33,11 @@ public:
     /**
      * @brief Initializes the locale system and loads the translation for the given language code
      *
+     * "en.json" is always loaded first; the requested language (file <langCode>.json) is merged on top of it. A
+     * missing language file leaves the English strings in place.
+     *
      * @param translationsDir Folder containing the translation JSON files
-     * @param langCode Language code to load (file <langCode>.json); missing files fall back to hardcoded English
+     * @param langCode Language code to load on top of English
      */
     static void init(const std::filesystem::path& translationsDir,
                      const std::string& langCode);
@@ -41,28 +46,23 @@ public:
      * @brief Looks up a translated string by key
      *
      * @param key Dot-separated translation key (e.g. "launcher.title")
-     * @param defaultValue Hardcoded English fallback used when the key is missing from the active translation
-     * @return wxString Translated string, or the fallback
+     * @return wxString Translated string, the English string if the active translation lacks the key, or the key
+     * itself if no translation file provides it
      */
-    [[nodiscard]] static auto tr(const std::string& key,
-                                 const char* defaultValue) -> wxString;
+    [[nodiscard]] static wxString tr(const std::string& key);
 
     /**
      * @brief Get the language code that is currently active
      */
-    [[nodiscard]] static auto getCurrentLanguage() -> std::string;
+    [[nodiscard]] static std::string currentLanguage();
 
     /**
      * @brief Lists the languages available in the translations folder (sorted by display name)
      */
-    [[nodiscard]] static auto getAvailableLanguages() -> std::vector<Language>;
+    [[nodiscard]] static std::vector<Language> availableLanguages();
 };
 
 /**
  * @brief Shorthand for PGLocale::tr
  */
-[[nodiscard]] inline auto PGTr(const std::string& key,
-                               const char* defaultValue) -> wxString
-{
-    return PGLocale::tr(key, defaultValue);
-}
+[[nodiscard]] inline wxString pgTr(const std::string& key) { return PGLocale::tr(key); }

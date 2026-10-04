@@ -9,6 +9,7 @@
 #include <wx/listctrl.h>
 #include <wx/wx.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,14 +22,17 @@
 class LauncherWindow : public wxDialog {
 public:
     /** ShowModal result indicating the launcher should be rebuilt (e.g. after a language change) */
-    constexpr static int RESULT_RELAUNCH = wxID_HIGHEST + 1;
+    constexpr static int resultRelaunch = wxID_HIGHEST + 1;
 
     /**
      * @brief Construct a new Launcher Window object
      *
-     * @param pgc PGC object for UI to use
+     * @param pgc PGC object for UI to use (holds the saved config, which "Save Config" / "Load Config" work against)
+     * @param initialParams params to show instead of the saved config, used to carry the unsaved UI state over when
+     *                      the launcher is rebuilt after a language or theme change
      */
-    LauncherWindow(PGConfig& pgc);
+    explicit LauncherWindow(PGConfig& pgc,
+                            std::optional<PGConfig::PGParams> initialParams = std::nullopt);
 
     /**
      * @brief Get the Params object (meant to be called after the user presses okay)
@@ -37,16 +41,25 @@ public:
      */
     void getParams(PGConfig::PGParams& params) const;
 
-private:
-    constexpr static int MIN_WIDTH = 750;
-    constexpr static int DEFAULT_HEIGHT = 800;
-    constexpr static int LEFTSIZER_MIN_SIZE = 440;
-    constexpr static int LEFTSIZER_WRAP_SIZE = 400;
-    constexpr static int BORDER_SIZE = 5;
-    constexpr static int BUTTON_FONT_SIZE = 12;
-    constexpr static int HELPBTN_SIZE = 30;
+    /**
+     * @brief Whether the user chose "Update Output" (only re-patch what changed since the previous output in the
+     * output location) instead of "Start Patching" (regenerate everything). Meant to be called after ShowModal returns
+     * wxID_OK.
+     */
+    [[nodiscard]] bool isUpdateRequested() const;
 
-    PGConfig& m_pgc; /** Reference to the PGConfig object */
+private:
+    // Sizes in DIPs (pixels at 100% scaling), scaled to the monitor's DPI with FromDIP() where they are used
+    constexpr static int minWidthDIP = 750;
+    constexpr static int leftSizerMinSize = 440;
+    constexpr static int leftSizerWrapSize = 400;
+    constexpr static int borderSizeDIP = 5;
+    constexpr static int buttonFontSize = 12;
+    constexpr static int helpButtonSize = 30;
+    constexpr static int settingsButtonIconSize = 16;
+
+    PGConfig& m_pgc; /** Reference to the PGConfig object, holds the saved config (never unsaved UI state) */
+    std::optional<PGConfig::PGParams> m_initialParams; /** Unsaved UI state to show instead of the saved config */
 
     /**
      * @brief Runs immediately after the wxDialog gets constructed, intended to set the UI elements to the initial
@@ -57,17 +70,24 @@ private:
     void onInitDialog(wxInitDialogEvent& event);
 
     /**
-     * @brief Loads config from PGC
+     * @brief Shows the saved config (the PGC params) in the UI, discarding unsaved changes
      */
     void loadConfig();
 
+    /**
+     * @brief Sets the UI elements to the given params without changing the saved config in PGC
+     *
+     * @param params Params to show
+     */
+    void setUIParams(const PGConfig::PGParams& params);
+
     //
-    // UI Param Elements
+    // UI Param Elements.
     //
 
-    // Game
-    bool m_gameLocationLocked;
-    bool m_gameLocationLockedByInstallLocation;
+    // Game.
+    bool m_isGameLocationLocked { false };
+    bool m_isGameLocationLockedByInstallLocation { false };
     wxTextCtrl* m_gameLocationTextbox;
     void onGameLocationChange(wxCommandEvent& event);
     wxButton* m_gameLocationBrowseButton;
@@ -75,7 +95,7 @@ private:
     std::unordered_map<BethesdaGame::GameType, wxRadioButton*> m_gameTypeRadios;
     void onGameTypeChange(wxCommandEvent& event);
 
-    // Mod Manager
+    // Mod Manager.
     std::unordered_map<PGModManager::ModManagerType, wxRadioButton*> m_modManagerRadios;
     void onModManagerChange(wxCommandEvent& event);
 
@@ -83,7 +103,7 @@ private:
     wxTextCtrl* m_mo2InstanceLocationTextbox;
     void onMO2InstanceLocationChange(wxCommandEvent& event);
 
-    // Output
+    // Output.
     wxTextCtrl* m_outputLocationTextbox;
     void onOutputLocationChange(wxCommandEvent& event);
 
@@ -93,7 +113,7 @@ private:
     wxComboBox* m_outputPluginLangCombo;
     void onOutputPluginLangChange(wxCommandEvent& event);
 
-    // Processing
+    // Processing.
     wxCheckBox* m_processingMultithreadingCheckbox;
     void onProcessingMultithreadingChange(wxCommandEvent& event);
 
@@ -106,11 +126,11 @@ private:
     wxCheckBox* m_processingEnableTraceLoggingCheckbox;
     void onProcessingEnableTraceLoggingChange(wxCommandEvent& event);
 
-    // Pre-Patchers
+    // Pre-Patchers.
     wxCheckBox* m_prePatcherFixMeshLightingCheckbox;
     void onPrePatcherFixMeshLightingChange(wxCommandEvent& event);
 
-    // Shader Patchers
+    // Shader Patchers.
     wxCheckBox* m_shaderPatcherParallaxCheckbox;
     void onShaderPatcherParallaxChange(wxCommandEvent& event);
 
@@ -120,11 +140,11 @@ private:
     wxCheckBox* m_shaderPatcherTruePBRCheckbox;
     void onShaderPatcherTruePBRChange(wxCommandEvent& event);
 
-    // Shader Transforms
+    // Shader Transforms.
     wxCheckBox* m_shaderTransformParallaxToCMCheckbox;
     void onShaderTransformParallaxToCMChange(wxCommandEvent& event);
 
-    // Post-Patchers
+    // Post-Patchers.
     wxCheckBox* m_postPatcherRestoreDefaultShadersCheckbox;
     void onPostPatcherRestoreDefaultShadersChange(wxCommandEvent& event);
 
@@ -134,25 +154,25 @@ private:
     wxCheckBox* m_postPatcherHairFlowMapCheckbox;
     void onPostPatcherHairFlowMapChange(wxCommandEvent& event);
 
-    // Global Patchers
+    // Global Patchers.
 
-    // Mesh Rules
+    // Mesh Rules.
     std::vector<std::wstring> m_meshRulesAllowListState;
     void onMeshRulesAllowBtn(wxCommandEvent& event);
 
     std::vector<std::wstring> m_meshRulesBlockListState;
     void onMeshRulesBlockBtn(wxCommandEvent& event);
 
-    // Texture Rules
+    // Texture Rules.
     std::vector<std::pair<std::wstring, PGEnums::TextureType>> m_textureRulesTextureMapsState;
     void onTextureRulesTextureMapsBtn(wxCommandEvent& event);
 
-    // Plugin Rules
-    std::unordered_set<PGPlugin::ModelRecordType> m_DialogRecTypeSelectorState;
+    // Plugin Rules.
+    std::unordered_set<PGPlugin::ModelRecordType> m_dialogRecTypeSelectorState;
     void onSelectPluginTypesBtn(wxCommandEvent& event);
 
     //
-    // UI Controls
+    // UI Controls.
     //
     wxStaticBoxSizer* m_mo2OptionsSizer; /** Stores the MO2-specific options since these are only sometimes shown */
     wxStaticBoxSizer* m_processingOptionsSizer; /** Stores the processing options */
@@ -189,12 +209,16 @@ private:
     void updateMO2Items();
 
     //
-    // Validation
+    // Validation.
     //
     wxButton* m_okButton; /** Stores the OKButton as a member var in case it needs to be disabled/enabled */
+    wxButton* m_updateOutputButton; /** "Update Output" button, only enabled when the output location holds a previous
+                                       output that can be updated */
     wxButton*
         m_saveConfigButton; /** Stores the SaveConfigButton as a member var in case it needs to be disabled/enabled */
     wxButton* m_loadConfigButton;
+
+    bool m_isUpdateRequested = false; /** True when the dialog was closed via "Update Output" */
 
     /**
      * @brief Event handler that triggers when the user presses "Start Patching" - performs validation
@@ -202,6 +226,13 @@ private:
      * @param event wxWidgets event object
      */
     void onOkButtonPressed(wxCommandEvent& event);
+
+    /**
+     * @brief Event handler that triggers when the user presses "Update Output" - performs validation
+     *
+     * @param event wxWidgets event object
+     */
+    void onUpdateOutputButtonPressed(wxCommandEvent& event);
 
     /**
      * @brief Event handler that triggers when the user presses the "Cancel" button
@@ -248,7 +279,7 @@ private:
     /**
      * @brief Saves current values to the config
      */
-    auto saveConfig() -> bool;
+    bool saveConfig();
 
     /**
      * @brief Set the Game Path Based On Exe location
