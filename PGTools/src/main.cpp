@@ -989,6 +989,18 @@ int mainRunner(PGToolsCLIArgs& args)
             }
             modJson["conflicts"] = conflicts;
 
+            // Additive fields for BodySlide ShapeData (vortex-collection-tools reads them, older readers ignore
+            // them): the game never loads those meshes, so a mod that only holds them has nothing to rank and a
+            // conflict that only arises on them is noise. `conflicts` itself stays complete.
+            modJson["onlyShapeData"] = mod->hasMeshes && !mod->hasNonShapeDataMeshes;
+
+            auto shapeDataConflicts = nlohmann::json::array();
+            for (const auto& conflictMod : mod->conflicts) {
+                if (!mod->nonShapeDataConflicts.contains(conflictMod))
+                    shapeDataConflicts.push_back(StringUtil::utf16toUTF8(conflictMod->name));
+            }
+            modJson["shapeDataConflicts"] = shapeDataConflicts;
+
             result.push_back(modJson);
         }
 

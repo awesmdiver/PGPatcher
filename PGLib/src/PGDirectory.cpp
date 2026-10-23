@@ -463,6 +463,8 @@ TaskTracker::Result PGDirectory::mapTexturesFromNIF(const std::filesystem::path&
         if (mod) {
             const std::unique_lock<std::shared_mutex> lock(mod->mutex);
             mod->hasMeshes = true;
+            if (!PGNIFUtil::isBodySlideShapeDataMesh(nifPath))
+                mod->hasNonShapeDataMeshes = true;
         }
     }
 
@@ -790,6 +792,8 @@ void PGDirectory::attributeMods(PGModManager& modManager)
 
         const std::unique_lock modLock(mod->mutex);
         mod->hasMeshes = true;
+        if (!PGNIFUtil::isBodySlideShapeDataMesh(path))
+            mod->hasNonShapeDataMeshes = true;
     }
 }
 

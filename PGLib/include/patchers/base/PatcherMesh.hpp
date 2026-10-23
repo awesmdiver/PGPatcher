@@ -44,6 +44,13 @@ public:
      */
     void setMeshUse(const PGPlugin::MeshUseAttributes& meshUse);
 
+    /**
+     * @brief Whether the NIF is a BodySlide ShapeData mesh (known once setMeshUse() ran)
+     *
+     * @return true if it is
+     */
+    [[nodiscard]] bool isBodySlideShapeData() const { return m_meshUse.isBodySlideShapeData; }
+
 protected:
     /**
      * @brief Get the NIF path for the current patcher (used only within child

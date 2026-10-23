@@ -422,6 +422,10 @@ std::vector<PatcherUtil::ShaderPatcherMatch> PGPatcher::matches(const PGTypes::T
 
         // Populate conflict mods if set.
         if (!modSet.empty()) {
+            // A conflict that only arises on BodySlide ShapeData meshes is tracked apart, the game never loads those.
+            const bool isShapeDataMesh = !patchers.shaderPatchers.empty()
+                && patchers.shaderPatchers.begin()->second->isBodySlideShapeData();
+
             // Add mods to conflict set.
             for (const auto& match : matches) {
                 if (!match.mod)
@@ -429,9 +433,13 @@ std::vector<PatcherUtil::ShaderPatcherMatch> PGPatcher::matches(const PGTypes::T
 
                 const std::unique_lock lock(match.mod->mutex);
 
-                for (const auto& conflictMod : modSet)
-                    if (conflictMod != match.mod)
-                        match.mod->conflicts.insert(conflictMod);
+                for (const auto& conflictMod : modSet) {
+                    if (conflictMod == match.mod)
+                        continue;
+                    match.mod->conflicts.insert(conflictMod);
+                    if (!isShapeDataMesh)
+                        match.mod->nonShapeDataConflicts.insert(conflictMod);
+                }
             }
         }
 

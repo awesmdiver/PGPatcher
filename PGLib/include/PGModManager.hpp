@@ -81,6 +81,8 @@ public:
         bool areMeshesIgnored = false;
         /// @brief True if the mod contains at least one NIF mesh file.
         bool hasMeshes = false;
+        /// @brief True if the mod contains at least one NIF mesh that is not BodySlide ShapeData.
+        bool hasNonShapeDataMeshes = false;
         /// @brief Index in the mod manager's native ordering (used as a secondary sort key).
         int modManagerOrder = 0;
         /// @brief User-assigned patch priority; higher values are applied later (win over lower).
@@ -89,6 +91,8 @@ public:
         std::set<PGEnums::ShapeShader> shaders;
         /// @brief Other mods whose files overlap with this mod's files.
         std::unordered_set<std::shared_ptr<Mod>, ModHash> conflicts;
+        /// @brief The subset of conflicts that arise from at least one shape outside BodySlide ShapeData meshes.
+        std::unordered_set<std::shared_ptr<Mod>, ModHash> nonShapeDataConflicts;
     };
 
 private:
