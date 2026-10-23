@@ -4,11 +4,14 @@
 #include "PGPlugin.hpp"
 #include "patchers/base/PatcherMeshShader.hpp"
 #include "pgutil/PGEnums.hpp"
+#include "pgutil/PGMaterialState.hpp"
 #include "pgutil/PGNIFUtil.hpp"
 #include "pgutil/PGTypes.hpp"
+#include "util/ExceptionHandler.hpp"
 #include "util/HashUtil.hpp"
 #include "util/Logger.hpp"
 #include "util/StringUtil.hpp"
+#include "util/TaskPoolRunner.hpp"
 
 #include "Geometry.hpp"
 #include "NifFile.hpp"
@@ -30,16 +33,30 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
-#include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+namespace {
+
+/// @brief Checks whether a PBR entry turns a boolean attribute on. A value of another type counts as off.
+bool isEnabled(const nlohmann::json& truePBRData,
+               const char* key)
+{
+    const auto it = truePBRData.find(key);
+    return it != truePBRData.end() && it->is_boolean() && it->get<bool>();
+}
+
+} // namespace
 
 PatcherMeshShaderTruePBR::PatcherMeshShaderTruePBR(std::filesystem::path nifPath,
                                                    nifly::NifFile* nif)
@@ -113,62 +130,120 @@ std::vector<std::string> PatcherMeshShaderTruePBR::truePBRConfigFilenameFields()
 }
 
 // Statics.
-void PatcherMeshShaderTruePBR::loadStatics(const std::vector<std::filesystem::path>& pbrJSONs)
+void PatcherMeshShaderTruePBR::loadStatics(const std::vector<std::filesystem::path>& pbrJSONs,
+                                           const bool& shouldMultithread)
 {
     auto* pgd = PGGlobals::pgd();
 
+    // The configs replace whatever an earlier call loaded.
+    truePBRConfigs().clear();
+    pathLookupJSONs().clear();
+    truePBRDiffuseInverse().clear();
+    truePBRNormalInverse().clear();
+    truePBRMatchXMap().clear();
+    {
+        const std::scoped_lock lock(pathLookupCacheMutex());
+        pathLookupCache().clear();
+    }
+
+    // Reading and parsing the files is independent work, and every file has to be opened on its own, so that part runs
+    // on the task pool. Everything that depends on the order of the configs happens afterwards, in the order of
+    // pbrJSONs.
+    struct ParsedConfig {
+        nlohmann::json json;
+        bool isParsed = false;
+        std::string parseError;
+        std::exception_ptr exception;
+    };
+    std::vector<ParsedConfig> parsedConfigs(pbrJSONs.size());
+
+    TaskPoolRunner runner(shouldMultithread);
+    for (size_t i = 0; i < pbrJSONs.size(); i++) {
+        runner.addTask([pgd, &pbrJSONs, &parsedConfigs, i] {
+            auto& parsedConfig = parsedConfigs[i];
+            try {
+                const auto configFileBytes = pgd->file(pbrJSONs[i]);
+                std::string configFileStr(configFileBytes.size(), '\0');
+                std::ranges::transform(
+                    configFileBytes, configFileStr.begin(), [](std::byte b) { return static_cast<char>(b); });
+
+                parsedConfig.json = nlohmann::json::parse(configFileStr);
+                parsedConfig.isParsed = true;
+            } catch (const nlohmann::json::parse_error& e) {
+                parsedConfig.parseError = e.what();
+            } catch (...) {
+                // Thrown again below on the calling thread. The runner would only record it and let the caller carry
+                // on with the configs that did load.
+                parsedConfig.exception = std::current_exception();
+            }
+        });
+    }
+
+    // Blocks until all tasks are done.
+    runner.runTasks();
+
+    if (ExceptionHandler::hasException()) {
+        // Something else in the run failed in the meantime. The runner skips its remaining tasks from then on, so
+        // configs may be missing.
+        throw std::runtime_error("TruePBR configs were not loaded because the run is being aborted");
+    }
+
     size_t configOrder = 0;
-    for (const auto& config : pbrJSONs) {
+    for (size_t i = 0; i < pbrJSONs.size(); i++) {
+        const auto& config = pbrJSONs[i];
+        auto& parsedConfig = parsedConfigs[i];
+
+        // file() throws for a config that is missing from the file map or from its archive. That stops the run here, on
+        // the calling thread, like it did when the configs were read one by one. A config that cannot be opened is not
+        // an exception: it comes back empty and is reported as a parse error below, which was the case before as well.
+        if (parsedConfig.exception)
+            std::rethrow_exception(parsedConfig.exception);
+
         // Check if Config is valid.
-        auto configFileBytes = pgd->file(config);
-        std::string configFileStr;
-        std::ranges::transform(
-            configFileBytes, std::back_inserter(configFileStr), [](std::byte b) { return static_cast<char>(b); });
-
-        try {
-            nlohmann::json j = nlohmann::json::parse(configFileStr);
-            nlohmann::json jDefaults;
-            nlohmann::json jEntries;
-
-            // Check if j is a json object.
-            if (j.is_object()) {
-                if (!j.contains("default") || !j.contains("entries"))
-                    continue;
-
-                jDefaults = j["default"];
-                jEntries = j["entries"];
-            } else {
-                jDefaults = nlohmann::json::object();
-                jEntries = j;
-            }
-
-            // Loop through each Element.
-            for (auto& element : jEntries) {
-                // Merge defaults with element.
-                for (const auto& [key, value] : jDefaults.items())
-                    if (!element.contains(key))
-                        element[key] = value;
-
-                // Preprocessing steps here.
-                if (element.contains("texture"))
-                    element["match_diffuse"] = element["texture"];
-
-                element["json"] = StringUtil::utf16toUTF8(config.wstring());
-
-                // Loop through filename Fields.
-                for (const auto& field : truePBRConfigFilenameFields())
-                    if (element.contains(field) && !boost::istarts_with(element[field].get<std::string>(), "\\"))
-                        element[field] = element[field].get<std::string>().insert(0, 1, '\\');
-
-                Logger::trace(L"TruePBR Config {} Loaded: {}", configOrder, StringUtil::utf8toUTF16(element.dump()));
-                truePBRConfigs()[configOrder++] = element;
-            }
-        } catch (nlohmann::json::parse_error& e) {
+        if (!parsedConfig.isParsed) {
             Logger::debug(L"Failed to parse TruePBR config JSON: {}. Error: {}",
                           config.wstring(),
-                          StringUtil::utf8toUTF16(e.what()));
+                          StringUtil::utf8toUTF16(parsedConfig.parseError));
             Logger::error(L"Failed to parse JSON: {}", config.wstring());
             continue;
+        }
+
+        nlohmann::json& j = parsedConfig.json;
+        nlohmann::json jDefaults;
+        nlohmann::json jEntries;
+
+        // Check if j is a json object.
+        if (j.is_object()) {
+            if (!j.contains("default") || !j.contains("entries"))
+                continue;
+
+            jDefaults = j["default"];
+            jEntries = j["entries"];
+        } else {
+            jDefaults = nlohmann::json::object();
+            jEntries = j;
+        }
+
+        // Loop through each Element.
+        for (auto& element : jEntries) {
+            // Merge defaults with element.
+            for (const auto& [key, value] : jDefaults.items())
+                if (!element.contains(key))
+                    element[key] = value;
+
+            // Preprocessing steps here.
+            if (element.contains("texture"))
+                element["match_diffuse"] = element["texture"];
+
+            element["json"] = StringUtil::utf16toUTF8(config.wstring());
+
+            // Loop through filename Fields.
+            for (const auto& field : truePBRConfigFilenameFields())
+                if (element.contains(field) && !boost::istarts_with(element[field].get<std::string>(), "\\"))
+                    element[field] = element[field].get<std::string>().insert(0, 1, '\\');
+
+            Logger::trace(L"TruePBR Config {} Loaded: {}", configOrder, StringUtil::utf8toUTF16(element.dump()));
+            truePBRConfigs()[configOrder++] = element;
         }
     }
 
@@ -243,11 +318,11 @@ bool PatcherMeshShaderTruePBR::shouldApply(nifly::NiShape& nifShape,
     matches.clear();
 
     // Find Old Slots.
-    auto oldSlots = textureSet(nifPath(), *nif(), nifShape);
+    auto oldSlots = PGNIFUtil::textureSlots(nif(), &nifShape);
 
     shouldApply(oldSlots, matches);
 
-    if (PGNIFUtil::hasShaderFlag(nifShaderBSLSP, nifly::SLSF2_UNUSED01)) {
+    if (nifShaderBSLSP && PGNIFUtil::hasShaderFlag(nifShaderBSLSP, nifly::SLSF2_UNUSED01)) {
         // Check if RMAOS exists.
         const auto& rmaosPath = oldSlots[static_cast<size_t>(PGEnums::TextureSlots::EnvMask)];
         if (!rmaosPath.empty() && pgd->isFile(rmaosPath)) {
@@ -276,18 +351,24 @@ bool PatcherMeshShaderTruePBR::shouldApply(const PGTypes::TextureSet& oldSlots,
         if (StringUtil::toLowerASCIIFast(prefix).starts_with(L"textures\\pbr\\"))
             prefix.replace(0, texturePBRStrLength, L"textures\\");
 
+    // The "nif_filter" attribute is written for the paths of regular meshes. Facegen and BodySlide ShapeData meshes
+    // live elsewhere, so the filter does not apply to them: with an empty filter path every entry applies.
+    const auto& use = meshUse();
+    const std::wstring nifFilterPath
+        = (use.isFacegen || use.isBodySlideShapeData) ? std::wstring() : nifPath().wstring();
+
     std::map<size_t, std::tuple<nlohmann::json, std::wstring>> truePBRData;
     // "match_normal" attribute: Binary search for normal map.
-    getSlotMatch(truePBRData, searchPrefixes[1], truePBRNormalInverse(), nifPath().wstring());
+    getSlotMatch(truePBRData, searchPrefixes[1], truePBRNormalInverse(), nifFilterPath);
 
     // "match_diffuse" attribute: Binary search for diffuse map.
-    getSlotMatch(truePBRData, searchPrefixes[0], truePBRDiffuseInverse(), nifPath().wstring());
+    getSlotMatch(truePBRData, searchPrefixes[0], truePBRDiffuseInverse(), nifFilterPath);
 
     // "path_contains" attribute: Linear search for path_contains.
-    getPathContainsMatch(truePBRData, searchPrefixes[0], nifPath().wstring());
+    getPathContainsMatch(truePBRData, searchPrefixes[0], nifFilterPath);
 
     // "matchX" attribute: search exact match for each slot.
-    getMatchXMatch(truePBRData, oldSlots, nifPath().wstring());
+    getMatchXMatch(truePBRData, oldSlots, nifFilterPath);
 
     // Split data into individual JSONs.
     std::unordered_map<std::wstring, std::map<size_t, std::tuple<nlohmann::json, std::wstring>>> truePBROutputData;
@@ -383,7 +464,7 @@ void PatcherMeshShaderTruePBR::getSlotMatch(std::map<size_t,
                                             const std::wstring& texName,
                                             const std::map<std::wstring,
                                                            std::vector<size_t>>& lookup,
-                                            const std::wstring& nifPath)
+                                            const std::wstring& nifFilterPath)
 {
     // Binary search for map.
     auto mapReverse = StringUtil::toLowerASCIIFast(texName);
@@ -433,14 +514,14 @@ void PatcherMeshShaderTruePBR::getSlotMatch(std::map<size_t,
 
     // Loop through all matches.
     for (const auto& cfg : cfgs)
-        insertTruePBRData(truePBRData, texName, cfg, nifPath);
+        insertTruePBRData(truePBRData, texName, cfg, nifFilterPath);
 }
 
 void PatcherMeshShaderTruePBR::getPathContainsMatch(std::map<size_t,
                                                              std::tuple<nlohmann::json,
                                                                         std::wstring>>& truePBRData,
                                                     const std::wstring& diffuse,
-                                                    const std::wstring& nifPath)
+                                                    const std::wstring& nifFilterPath)
 {
     // "patch_contains" attribute: Linear search for path_contains.
     auto& cache = pathLookupCache();
@@ -463,7 +544,7 @@ void PatcherMeshShaderTruePBR::getPathContainsMatch(std::map<size_t,
         }
 
         if (pathMatch)
-            insertTruePBRData(truePBRData, diffuse, config.first, nifPath);
+            insertTruePBRData(truePBRData, diffuse, config.first, nifFilterPath);
     }
 }
 
@@ -471,7 +552,7 @@ void PatcherMeshShaderTruePBR::getMatchXMatch(std::map<size_t,
                                                        std::tuple<nlohmann::json,
                                                                   std::wstring>>& truePBRData,
                                               const PGTypes::TextureSet& oldSlots,
-                                              const std::wstring& nifPath)
+                                              const std::wstring& nifFilterPath)
 {
     const auto& truePBRMatchXMap = PatcherMeshShaderTruePBR::truePBRMatchXMap();
     for (size_t i = 0; i < numTextureSlots - 1; i++) {
@@ -494,7 +575,7 @@ void PatcherMeshShaderTruePBR::getMatchXMatch(std::map<size_t,
 
         // Add to truePBRData.
         for (const auto& cfg : matchXMap.at(lookupStr))
-            insertTruePBRData(truePBRData, PGNIFUtil::texBase(lookupStr, curSlot), cfg, nifPath);
+            insertTruePBRData(truePBRData, PGNIFUtil::texBase(lookupStr, curSlot), cfg, nifFilterPath);
     }
 }
 
@@ -503,13 +584,16 @@ void PatcherMeshShaderTruePBR::insertTruePBRData(std::map<size_t,
                                                                      std::wstring>>& truePBRData,
                                                  const std::wstring& texName,
                                                  size_t cfg,
-                                                 const std::wstring& nifPath)
+                                                 const std::wstring& nifFilterPath)
 {
     auto curCfg = truePBRConfigs()[cfg];
 
-    // Check if we should skip this due to nif filter (this is expsenive, so we do it last).
-    if (curCfg.contains("nif_filter") && !boost::icontains(nifPath, curCfg["nif_filter"].get<std::string>()))
+    // Check if we should skip this due to nif filter (this is expensive, so we do it last). An empty filter path means
+    // the mesh is not subject to the filter.
+    if (!nifFilterPath.empty() && curCfg.contains("nif_filter")
+        && !boost::icontains(nifFilterPath, curCfg["nif_filter"].get<std::string>())) {
         return;
+    }
 
     // Find and check prefix value.
     // Add the PBR part to the texture path.
@@ -584,6 +668,10 @@ void PatcherMeshShaderTruePBR::applyShader(nifly::NiShape& nifShape)
 
     auto* nifShader = nif()->GetShader(&nifShape);
     auto* const nifShaderBSLSP = dynamic_cast<nifly::BSLightingShaderProperty*>(nifShader);
+    if (!nifShaderBSLSP) {
+        // Only lighting shaders carry the PBR flags.
+        return;
+    }
 
     // Set default PBR shader type.
     PGNIFUtil::setShaderType(nifShader, nifly::BSLSP_DEFAULT);
@@ -645,6 +733,9 @@ bool PatcherMeshShaderTruePBR::applyOnePatch(nifly::NiShape* nifShape,
 {
     bool isChanged = false;
 
+    if (!nifShape)
+        return isChanged;
+
     // Prep.
     auto* nifShader = nif()->GetShader(nifShape);
     auto* const nifShaderBSLSP = dynamic_cast<nifly::BSLightingShaderProperty*>(nifShader);
@@ -653,6 +744,11 @@ bool PatcherMeshShaderTruePBR::applyOnePatch(nifly::NiShape* nifShape,
     if (truePBRData.contains("delete") && truePBRData["delete"].is_boolean() && truePBRData["delete"]) {
         nif()->DeleteShape(nifShape);
         isChanged = true;
+        return isChanged;
+    }
+
+    if (!nifShaderBSLSP) {
+        // Only lighting shader shapes carry PBR data.
         return isChanged;
     }
 
@@ -741,6 +837,31 @@ bool PatcherMeshShaderTruePBR::applyOnePatch(nifly::NiShape* nifShape,
     if (truePBRData.contains("zbuffer_write") && truePBRData["zbuffer_write"].is_boolean()) {
         const auto newZBufferWrite = truePBRData["zbuffer_write"].get<bool>();
         isChanged |= PGNIFUtil::configureShaderFlag(nifShaderBSLSP, nifly::SLSF2_ZBUFFER_WRITE, newZBufferWrite);
+    }
+
+    // "alphaprop_delete", "alphaprop_flags", "alphaprop_thresh" and "alphaprop_create" attributes. "alphaprop_delete"
+    // removes the alpha property, and the other three are ignored then. A shape without an alpha property only gets
+    // one with "alphaprop_create"; both booleans are off unless the entry turns them on. A value that does not fit its
+    // NiAlphaProperty field is ignored like one of the wrong type.
+    if (isEnabled(truePBRData, "alphaprop_delete")) {
+        isChanged |= PGNIFUtil::deleteAlphaProperty(*nif(), *nifShape);
+    } else {
+        std::optional<uint16_t> newAlphaFlags;
+        uint16_t alphaFlags = 0;
+        if (truePBRData.contains("alphaprop_flags")
+            && PGMaterialState::unsignedFromJSON(truePBRData["alphaprop_flags"], alphaFlags)) {
+            newAlphaFlags = alphaFlags;
+        }
+
+        std::optional<uint8_t> newAlphaThreshold;
+        uint8_t alphaThreshold = 0;
+        if (truePBRData.contains("alphaprop_thresh")
+            && PGMaterialState::unsignedFromJSON(truePBRData["alphaprop_thresh"], alphaThreshold)) {
+            newAlphaThreshold = alphaThreshold;
+        }
+
+        isChanged |= PGNIFUtil::setAlphaProperty(
+            *nif(), *nifShape, newAlphaFlags, newAlphaThreshold, isEnabled(truePBRData, "alphaprop_create"));
     }
 
     // "specular_level" attribute.

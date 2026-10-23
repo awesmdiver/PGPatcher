@@ -14,11 +14,13 @@
 #include "PGRunCache.hpp"
 #include "PGUI.hpp"
 #include "common/BethesdaGame.hpp"
+#include "common/MO2DataFolder.hpp"
 #include "patchers/PatcherMeshPostFixSSS.hpp"
 #include "patchers/PatcherMeshPostHairFlowMap.hpp"
 #include "patchers/PatcherMeshPostRestoreDefaultShaders.hpp"
 #include "patchers/PatcherMeshPreFixMeshLighting.hpp"
 #include "patchers/PatcherMeshPreFixTextureSlotCount.hpp"
+#include "patchers/PatcherMeshPreStockMarker.hpp"
 #include "patchers/PatcherMeshShaderComplexMaterial.hpp"
 #include "patchers/PatcherMeshShaderDefault.hpp"
 #include "patchers/PatcherMeshShaderTransformParallaxToCM.hpp"
@@ -51,6 +53,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -272,6 +275,7 @@ uint64_t computeConfigFingerprint(const PGConfig::PGParams& params,
     hasher.add(StringUtil::toLowerASCII(params.modManager.mo2InstanceDir.wstring()));
 
     hasher.add(params.processing.enableModDevMode);
+    hasher.add(params.processing.isPGLiteMode);
 
     std::vector<uint8_t> recTypes;
     for (const auto& recType : params.processing.allowedModelRecordTypes)
@@ -307,6 +311,7 @@ uint64_t computeConfigFingerprint(const PGConfig::PGParams& params,
     hasher.add(params.postPatcher.disablePrePatchedMaterials);
     hasher.add(params.postPatcher.isFixSSSEnabled);
     hasher.add(params.postPatcher.isHairFlowMapEnabled);
+    hasher.add(params.globalPatcher.isRecalculateBoundsEnabled);
 
     hasher.add(args.considerAllMeshes);
     hasher.add(args.disableDynCubemap);
@@ -348,7 +353,8 @@ uint64_t computePluginFingerprint(const BethesdaGame& bg,
     return hasher.value();
 }
 
-void mainRunnerPrep(const ParallaxGenCLIArgs& args,
+// Returns false when the preparation stopped early, after reporting why. Nothing may be patched then.
+bool mainRunnerPrep(const ParallaxGenCLIArgs& args,
                     const PGConfig::PGParams& params,
                     const bool& updateOutput,
                     const std::filesystem::path& exePath,
@@ -375,17 +381,30 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     //
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepLabel(pgTr("progress.steps.initGpu")); });
 
-    // Check if GPU needs to be initialized.
-    Logger::info("Initializing GPU");
-    if (!pgd3d->initGPU()) {
-        Logger::critical("Failed to initialize GPU. Exiting.");
-        return;
-    }
+    // Nothing uses the GPU before the file map is populated, so it is initialized in the background until then.
+    // The task sets isGPUReady, which is read once the queue has been shut down. It is declared before the queue so
+    // that it outlives the worker thread on every way out of this function.
+    bool isGPUReady = false;
+    TaskQueue gpuInit;
+    const auto initGPUTask = [pgd3d, &isGPUReady] {
+        // Check if GPU needs to be initialized.
+        Logger::info("Initializing GPU");
+        if (!pgd3d->initGPU()) {
+            Logger::critical("Failed to initialize GPU. Exiting.");
+            return;
+        }
 
-    if (!pgd3d->initShaders()) {
-        Logger::critical("Failed to initialize internal shaders. Exiting.");
-        return;
-    }
+        if (!pgd3d->initShaders()) {
+            Logger::critical("Failed to initialize internal shaders. Exiting.");
+            return;
+        }
+
+        isGPUReady = true;
+    };
+    if (params.processing.multithread)
+        gpuInit.queueTask(initGPUTask);
+    else
+        initGPUTask();
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(1, numPreparingSteps); });
     //
@@ -406,28 +425,38 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
             Logger::debug(L"Output directory created: {}", params.output.dir.wstring());
     } catch (const std::filesystem::filesystem_error& e) {
         Logger::critical("Failed to create output directory: {}", e.what());
-        return;
+        return false;
     }
 
     // If output dir is the same as data dir meshes might get overwritten.
     if (std::filesystem::equivalent(params.output.dir, pgd->dataPath())) {
         Logger::critical("Output directory cannot be the same directory as your data folder. "
                          "Exiting.");
-        return;
+        return false;
     }
 
     // If output dir is a subdirectory of data dir vfs issues can occur.
     if (boost::istarts_with(params.output.dir.wstring(), bg->gameDataPath().wstring() + L"\\")) {
         Logger::critical("Output directory cannot be a subdirectory of your data folder. Exiting.");
-        return;
+        return false;
     }
 
     // Update cache: "Update Output" re-patches only what changed since the previous output in the output directory,
     // "Start Patching" regenerates everything. Zipped outputs are always generated from scratch and leave no cache.
     if (updateOutput && params.output.zip)
         Logger::warn("Zip output is enabled, so the previous output cannot be updated and is generated from scratch");
-    PGRunCache::initialize(params.output.dir / PGRunCache::s_cacheFilename, !params.output.zip, !updateOutput);
-    PGRunCache::setConfigFingerprint(computeConfigFingerprint(params, args));
+
+    // Nothing reads the cache before the file map is populated, so a previous output is loaded in the background
+    // until then.
+    TaskQueue cacheInit;
+    const auto initCacheTask = [&params, &args, &updateOutput] {
+        PGRunCache::initialize(params.output.dir / PGRunCache::s_cacheFilename, !params.output.zip, !updateOutput);
+        PGRunCache::setConfigFingerprint(computeConfigFingerprint(params, args));
+    };
+    if (params.processing.multithread)
+        cacheInit.queueTask(initCacheTask);
+    else
+        initCacheTask();
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(2, numPreparingSteps); });
     //
@@ -446,15 +475,16 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
         Logger::critical(
             "DynDoLOD and TexGen outputs must be disabled prior to running PGPatcher. It is recommended to "
             "generate LODs after running PGPatcher with the PGPatcher output enabled.");
-        return;
+        return false;
     }
 
     // Log active plugins.
     const std::wstring loadOrderStr = boost::algorithm::join(activePlugins, L",");
     Logger::debug(L"Active Plugin Load Order: {}", loadOrderStr);
 
-    // Update cache: mesh uses can be reused from the previous run if no plugin changed.
-    PGRunCache::setPluginFingerprint(computePluginFingerprint(*bg, activePlugins));
+    // Update cache: mesh uses can be reused from the previous run if no plugin changed. The cache is given the
+    // fingerprint once it has been loaded.
+    const auto pluginFingerprint = computePluginFingerprint(*bg, activePlugins);
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(3, numPreparingSteps); });
     //
@@ -498,23 +528,51 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     if (FileUtil::getJSON(modListFile, modJSON))
         pgmm->loadJSON(modJSON);
 
+    // Under MO2's virtual file system the view of an instance (its mod folders, listed in parallel, and the real data
+    // folder) is also the file map's source, since listing the data folder through usvfs merges it file by file: the
+    // configured instance's view when that instance is the one PGPatcher runs under, else the view of the instance
+    // that launched PGPatcher (PGModManager::fileMapInstanceDir), whatever the configured mod manager, else the
+    // listing as before. The configured MO2 instance's view is the mod list's in every case, and outlives the task
+    // queue that fills it.
+    const bool isMO2Configured = params.modManager.type == PGModManager::ModManagerType::ModOrganizer2
+        && !params.modManager.mo2InstanceDir.empty();
+    const auto mo2Dir = PGModManager::mo2DirFromUSVFS();
+    const auto fileMapInstanceDir = PGModManager::fileMapInstanceDir(
+        isMO2Configured ? params.modManager.mo2InstanceDir : std::filesystem::path(), bg->pluginsFile());
+    std::error_code ec;
+    const bool isConfiguredTheFileMaps = isMO2Configured && !fileMapInstanceDir.empty()
+        && std::filesystem::equivalent(fileMapInstanceDir, params.modManager.mo2InstanceDir, ec);
+    if (!fileMapInstanceDir.empty()) {
+        Logger::info(L"The file map is built from the Mod Organizer 2 instance {}", fileMapInstanceDir.wstring());
+    } else if (!mo2Dir.empty()) {
+        Logger::info("The file map is listed through Mod Organizer 2's virtual file system, no known instance is the "
+                     "one PGPatcher runs under");
+    }
+    std::unique_ptr<MO2DataFolder> mo2View;
     TaskQueue modManagerInit;
 
-    if (params.modManager.type == PGModManager::ModManagerType::ModOrganizer2
-        && !params.modManager.mo2InstanceDir.empty()) {
+    if (isMO2Configured) {
         // Make sure running is USVFS.
-        if (!args.ignoreMO2Check && !PGHandlers::isUnderUSVFS()) {
+        if (!args.ignoreMO2Check && mo2Dir.empty()) {
             Logger::critical("Please verify that you are launching PGPatcher from MO2, VFS not detected.");
-            return;
+            return false;
         }
 
-        // MO2.
-        if (params.processing.multithread) {
-            modManagerInit.queueTask(
-                [&pgmm, &params] { pgmm->populateModFileMapMO2(params.modManager.mo2InstanceDir, params.output.dir); });
-        } else {
-            pgmm->populateModFileMapMO2(params.modManager.mo2InstanceDir, params.output.dir);
-        }
+        const auto populateMO2 = [&pgmm, &params, &bg, &mo2View, isConfiguredTheFileMaps] {
+            mo2View = std::make_unique<MO2DataFolder>(
+                MO2DataFolder::read(params.modManager.mo2InstanceDir,
+                                    bg->gameDataPath(),
+                                    {
+                                        .foldersToMap = PGGlobals::s_foldersToMap,
+                                        .shouldMultithread = params.processing.multithread,
+                                        .shouldListDataFolder = isConfiguredTheFileMaps,
+                                    }));
+            pgmm->populateModFileMapMO2(*mo2View, params.output.dir);
+        };
+        if (params.processing.multithread)
+            modManagerInit.queueTask(populateMO2);
+        else
+            populateMO2();
     } else if (params.modManager.type == PGModManager::ModManagerType::Vortex) {
         // Vortex.
         if (params.processing.multithread)
@@ -534,8 +592,51 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     progressWindow->CallAfter(
         [progressWindow] { progressWindow->setStepLabel(pgTr("progress.steps.populatingFileMap")); });
 
-    // Init file map.
-    pgd->populateFileMap(true);
+    // Init file map, from a view when an instance's one is what the virtual file system serves: the configured
+    // instance's (read by the mod manager task; a read that failed is latched and stops the preparation below), or
+    // the one of the instance that launched PGPatcher, read here.
+    std::unique_ptr<MO2DataFolder> fileMapView;
+    if (!fileMapInstanceDir.empty()) {
+        if (isConfiguredTheFileMaps) {
+            // Joined, as the other queues are.
+            modManagerInit.waitForCompletion();
+            modManagerInit.shutdown();
+            if (mo2View)
+                pgd->setLooseFileSource(mo2View.get());
+        } else {
+            try {
+                fileMapView = std::make_unique<MO2DataFolder>(MO2DataFolder::read(
+                    fileMapInstanceDir,
+                    bg->gameDataPath(),
+                    { .foldersToMap = PGGlobals::s_foldersToMap, .shouldMultithread = params.processing.multithread }));
+                pgd->setLooseFileSource(fileMapView.get());
+            } catch (const std::exception& e) {
+                Logger::warn("Unable to read the Mod Organizer 2 instance that launched PGPatcher, the data folder is "
+                             "listed through the virtual file system: {}",
+                             e.what());
+            }
+        }
+    }
+    pgd->populateFileMap(true, params.processing.multithread);
+    pgd->setLooseFileSource(nullptr);
+
+    // The GPU and the update cache are needed from here on.
+    gpuInit.waitForCompletion();
+    gpuInit.shutdown();
+    cacheInit.waitForCompletion();
+    cacheInit.shutdown();
+    if (ExceptionHandler::hasException()) {
+        // A worker thread's exception is latched instead of thrown here. The preparation stops before the patch phase
+        // deletes the previous output; the main thread reports the exception once the dialog closes.
+        return false;
+    }
+    if (!isGPUReady) {
+        // GPU initialization failed, which the task has reported, or it never ran. Either way the preparation ends
+        // here, like it did when the GPU was initialized on this thread.
+        return false;
+    }
+
+    PGRunCache::setPluginFingerprint(pluginFingerprint);
 
     // Update cache: texture metadata of unchanged textures does not need to be read again.
     PGRunCache::seedTextureMetadata();
@@ -557,13 +658,13 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     if (std::filesystem::exists(pgStateFilePath)) {
         Logger::critical("PGPatcher meshes exist in your data directory, please delete before "
                          "re-running.");
-        return;
+        return false;
     }
 
     // Check if VRAMR Output is enabled.
     if (params.modManager.type != PGModManager::ModManagerType::None && pgd->isFile("vramroutput.tmp")) {
         Logger::critical("Please disable VRAMr output mod before running PGPatcher.");
-        return;
+        return false;
     }
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(7, numPreparingSteps); });
@@ -596,6 +697,9 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     activePatchers.fixSSS = params.postPatcher.isFixSSSEnabled;
     activePatchers.hairFlowMap = params.postPatcher.isHairFlowMapEnabled;
     auto meshPatchers = PGPatcher::buildStandardMeshPatcherSet(activePatchers);
+    // In PGLite mode the stock marker also records the stock state of every patched shape, which PGLite reverts the
+    // output's meshes from.
+    PatcherMeshPreStockMarker::loadOptions(params.processing.isPGLiteMode);
 
     // Caller-specific option-loading and shader-hook initialization -- deliberately NOT part of the
     // shared function above (see its own doc comment for why: this GUI's own option sources and
@@ -626,7 +730,7 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
         // Initialize patcher hooks.
         if (!PatcherTextureHookConvertToCM::initShader()) {
             Logger::critical("Failed to initialize ConvertToCM shader");
-            return;
+            return false;
         }
     }
     if (params.postPatcher.disablePrePatchedMaterials) {
@@ -637,7 +741,7 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
 
         if (!PatcherTextureHookFixSSS::initShader()) {
             Logger::critical("Failed to initialize FixSSS shader");
-            return;
+            return false;
         }
     }
     if (params.postPatcher.isHairFlowMapEnabled) {
@@ -658,6 +762,8 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     // Plugins required for map files.
     pluginInit.waitForCompletion();
     pluginInit.shutdown();
+    if (ExceptionHandler::hasException())
+        return false;
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(9, numPreparingSteps); });
 
@@ -671,6 +777,8 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
     // Mods required for map files.
     modManagerInit.waitForCompletion();
     modManagerInit.shutdown();
+    if (ExceptionHandler::hasException())
+        return false;
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(10, numPreparingSteps); });
 
@@ -689,10 +797,14 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
                   params.processing.vanillaBSAList,
                   params.processing.multithread,
                   progressCallback);
+    if (ExceptionHandler::hasException()) {
+        // The mapping tasks latch their exceptions as well.
+        return false;
+    }
 
     // Any patcher initialization that requires PGD.
     if (params.shaderPatcher.isTruePBREnabled)
-        PatcherMeshShaderTruePBR::loadStatics(pgd->pbrJSONs());
+        PatcherMeshShaderTruePBR::loadStatics(pgd->pbrJSONs(), params.processing.multithread);
 
     // Extended texture classification (complex material detection) runs on a background
     // queue and adds shader types to mods as it completes. Wait for it here so mod enable
@@ -702,11 +814,18 @@ void mainRunnerPrep(const ParallaxGenCLIArgs& args,
         [progressWindow] { progressWindow->setStepLabel(pgTr("progress.steps.classifyingTextures")); });
     pgd->waitForCMClassification();
 
+    // The plugin mesh use lookups run on a background queue as well. Waiting for them here lets a failed lookup stop
+    // the preparation before the patch phase deletes the previous output; the wait in patchMeshes then returns at once.
+    pgd->waitForMeshMapping();
+    if (ExceptionHandler::hasException())
+        return false;
+
     // Assign new mod priorities for new mods.
     pgmm->updateStateFromModlist(params.modManager.shouldUseMO2LooseFileOrder);
 
     // The modrules.json file is deliberately not saved here: the state computed above is re-derived on every
     // run, and the file must only change when the user applies changes in the conflict manager.
+    return true;
 }
 
 void mainRunnerPatch(const ParallaxGenCLIArgs& args,
@@ -716,6 +835,11 @@ void mainRunnerPatch(const ParallaxGenCLIArgs& args,
                      const std::function<void(size_t,
                                               size_t)>& progressCallback)
 {
+    if (ExceptionHandler::hasException()) {
+        // A preparation thread failed: nothing is patched and the previous output stays as it is.
+        return;
+    }
+
     // Make sure the state is clean for the patch.
     PGPatcher::resetRunState();
     PGPlugin::resetPatchingState();
@@ -755,12 +879,26 @@ void mainRunnerPatch(const ParallaxGenCLIArgs& args,
     progressWindow->CallAfter(
         [progressWindow] { progressWindow->setStepLabel(pgTr("progress.steps.processingNifs")); });
 
+    // Updating a previous output evaluates every mesh before patching, and both passes report to the step progress
+    // bar. Each pass gets its own label so the bar is not seen filling twice under the same status.
+    const auto meshPatchStageCallback = [progressWindow](PGPatcher::MeshPatchStage stage) {
+        progressWindow->CallAfter([progressWindow, stage] {
+            progressWindow->setStepLabel(stage == PGPatcher::MeshPatchStage::EvaluatingPreviousOutput
+                                             ? pgTr("progress.steps.evaluatingPreviousOutput")
+                                             : pgTr("progress.steps.processingNifs"));
+            progressWindow->setStepProgress(0, 1);
+        });
+    };
+
     PGPatcher::patchMeshes(params.processing.multithread,
                            args.considerAllMeshes,
                            params.processing.allowedModelRecordTypes,
                            true,
                            args.excludeFacegens,
-                           progressCallback);
+                           params.processing.isPGLiteMode,
+                           progressCallback,
+                           meshPatchStageCallback,
+                           params.globalPatcher.isRecalculateBoundsEnabled);
 
     progressWindow->CallAfter([progressWindow] {
         progressWindow->setMainLabel(pgTr("progress.steps.patchingTextures"));
@@ -795,8 +933,15 @@ void mainRunnerPatch(const ParallaxGenCLIArgs& args,
     // END FINISH WRITING FILES.
     //
 
-    // Check for empty output.
-    if (PGPatcher::isOutputEmpty()) {
+    if (ExceptionHandler::hasException()) {
+        // A failed patch pass saves no plugin and is not recorded as a complete run; the main thread reports the
+        // exception once the dialog closes.
+        return;
+    }
+
+    // Check for empty output. Record overrides count: a run whose only changes are OBND overrides writes no file but
+    // the plugin.
+    if (PGPatcher::isOutputEmpty() && !PGPlugin::hasModifiedRecords()) {
         // Output is empty, there is no previous output to update anymore.
         PGRunCache::discard();
         Logger::warn("Output directory is empty. No files were generated.");
@@ -815,6 +960,27 @@ void mainRunnerPatch(const ParallaxGenCLIArgs& args,
     else if (args.noEsm)
         esmMode = PGPlugin::ESMMode::None;
     PGPlugin::savePlugin(params.output.dir, esmMode);
+
+    if (params.processing.isPGLiteMode) {
+        // The stock records PGLite puts the records back from when it runs next to this output, with the textures
+        // the run generated, which PGLite keeps out of its inputs (the dynamic cubemap is deployed below, not
+        // generated).
+        std::vector<std::filesystem::path> generatedTextures;
+        const auto texturesDir = params.output.dir / "textures";
+        if (std::filesystem::is_directory(texturesDir)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(texturesDir)) {
+                if (!entry.is_regular_file())
+                    continue;
+
+                const std::filesystem::path relPath
+                    = StringUtil::toLowerASCII(entry.path().lexically_relative(params.output.dir).wstring());
+                if (relPath != PatcherMeshShaderComplexMaterial::s_dynCubemapPath)
+                    generatedTextures.push_back(relPath);
+            }
+        }
+        PGPlugin::saveStockRecords(params.output.dir, generatedTextures);
+        PGGlobals::pgd()->addGeneratedFile(PGPlugin::stockRecordsFile);
+    }
 
     progressWindow->CallAfter([progressWindow] { progressWindow->setStepProgress(2, numFinalizingSteps); });
 
@@ -896,6 +1062,7 @@ void mainRunner(ParallaxGenCLIArgs& args,
                 const std::filesystem::path& exePath)
 {
     ExceptionHandler::setMainThread();
+    ExceptionHandler::setTaskGuard(ExceptionHandler::cppTraceGuard);
 
     // Define paths.
     PGPatcherGlobals::setEXEPath(exePath);
@@ -958,11 +1125,20 @@ void mainRunner(ParallaxGenCLIArgs& args,
     // FIXME: Control the lifetime of these in PGLib.
     auto bg = BethesdaGame(params.game.type, params.game.dir);
     PGGlobals::setBG(&bg);
+    // A configured instance whose profile is not the game's (PGPatcher runs under another instance or profile) would
+    // attribute the mods wrongly. The game's Plugins.txt is the profile's only through the virtual file system.
+    if (params.modManager.type == PGModManager::ModManagerType::ModOrganizer2
+        && !params.modManager.mo2InstanceDir.empty() && PGHandlers::isUnderUSVFS()
+        && !PGModManager::matchesActivePlugins(params.modManager.mo2InstanceDir, bg.pluginsFile())) {
+        Logger::warn(L"The active plugins of the Mod Organizer 2 instance {} are not the game's: PGPatcher runs under "
+                     L"another instance or profile; set the instance it runs under in the launcher",
+                     params.modManager.mo2InstanceDir.wstring());
+    }
     auto pgmm = PGModManager(params.modManager.type);
     PGGlobals::setPGMM(&pgmm);
     auto pgd = PGDirectory(&bg, params.output.dir);
     PGGlobals::setPGD(&pgd);
-    auto pgd3d = PGD3D(exePath / "cshaders");
+    auto pgd3d = PGD3D();
     PGGlobals::setPGD3D(&pgd3d);
 
     // Create progress dialog object.
@@ -984,20 +1160,29 @@ void mainRunner(ParallaxGenCLIArgs& args,
     const auto startTime = std::chrono::high_resolution_clock::now();
     long long timeTaken = 0;
 
-    // Dispatch the pre-generation task.
+    // Dispatch the pre-generation task. isPrepared is declared before the queue so that it outlives the worker thread
+    // that sets it.
+    std::atomic<bool> isPrepared = false;
     TaskQueue backgroundRunners;
-    backgroundRunners.queueTask([&args, &params, &updateOutput, &exePath, &progressWindow, &cfgDir, &progressCallback] {
-        mainRunnerPrep(args, params, updateOutput, exePath, cfgDir, progressWindow, progressCallback);
+    backgroundRunners.queueTask(
+        [&args, &params, &updateOutput, &exePath, &progressWindow, &cfgDir, &progressCallback, &isPrepared] {
+            isPrepared = mainRunnerPrep(args, params, updateOutput, exePath, cfgDir, progressWindow, progressCallback);
+            if (!isPrepared) {
+                // The preparation has reported why it stopped. Nothing is patched, and the output is left alone.
+                auto* const progressWindowPtr = progressWindow;
+                progressWindow->CallAfter([progressWindowPtr] { progressWindowPtr->EndModal(wxID_OK); });
+                return;
+            }
 
-        // Snapshot message counts after prep so re-runs of the patching step can discard
-        // messages from a previous patch run while keeping preparation-phase messages.
-        PGPatcherGlobals::wxLoggerSink()->markRunStart();
-        Logger::markRunStart();
+            // Snapshot message counts after prep so re-runs of the patching step can discard
+            // messages from a previous patch run while keeping preparation-phase messages.
+            PGPatcherGlobals::wxLoggerSink()->markRunStart();
+            Logger::markRunStart();
 
-        mainRunnerPatch(args, params, exePath, progressWindow, progressCallback);
-        auto* const progressWindowPtr = progressWindow;
-        progressWindow->CallAfter([progressWindowPtr] { progressWindowPtr->EndModal(wxID_OK); });
-    });
+            mainRunnerPatch(args, params, exePath, progressWindow, progressCallback);
+            auto* const progressWindowPtr = progressWindow;
+            progressWindow->CallAfter([progressWindowPtr] { progressWindowPtr->EndModal(wxID_OK); });
+        });
 
     // Show progress dialog (this will block until closed by one of the callafters).
     progressWindow->ShowModal();
@@ -1005,6 +1190,11 @@ void mainRunner(ParallaxGenCLIArgs& args,
     // Verify tasks are finished.
     ExceptionHandler::throwExceptionOnMainThread();
     backgroundRunners.waitForCompletion();
+
+    if (!isPrepared) {
+        // There is no finished run to show.
+        return;
+    }
 
     // Confirmation UI.
     const auto endTime = std::chrono::high_resolution_clock::now();

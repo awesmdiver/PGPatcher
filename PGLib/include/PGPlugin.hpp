@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -83,12 +84,14 @@ public:
         },
     };
 
+    /// @brief Which output plugins get the ESM flag when they are saved.
     enum class ESMMode : uint8_t {
         PGPatcherOnly = 0, // ESM flag only PGPatcher.esp (default)
         All = 1, // ESM flag all output plugins
         None = 2, // do not ESM flag any output plugin
     };
 
+    /// @brief Plugin record types that carry models, named after their xEdit signatures.
     enum class ModelRecordType : uint8_t {
         Activator, // ACTI
         Ammunition, // AMMO
@@ -169,6 +172,25 @@ public:
     };
 
     /**
+     * @brief What orders the uses of a mesh, see isUseOrderedBefore(). The strings are views into the use.
+     */
+    struct UseOrder {
+        bool hasAlternateTextures = false;
+        bool isWeighted = false;
+        std::wstring_view modName;
+        unsigned formID = 0;
+        std::string_view subModel;
+    };
+
+    /**
+     * @brief The order the uses of a mesh are patched in: uses without alternate textures first, weighted uses first,
+     * then by plugin name, form ID and sub model. The first use of a mesh is the one that keeps the original path when
+     * the uses patch differently, so the offline program and the PGLite runtime order them the same way.
+     */
+    [[nodiscard]] static bool isUseOrderedBefore(const UseOrder& a,
+                                                 const UseOrder& b);
+
+    /**
      * @brief Stores attributes describing how a mesh record uses a 3D model.
      */
     struct MeshUseAttributes {
@@ -178,6 +200,8 @@ public:
         bool isSinglepassMATO = false;
         /// @brief True if this mesh is facegen
         bool isFacegen = false;
+        /// @brief True if this mesh is BodySlide ShapeData, which BodySlide builds its output meshes from
+        bool isBodySlideShapeData = false;
         /// @brief True if this mesh use should be excluded from patching.
         bool isIgnored = false;
         /// @brief True if this is a dummy use not actually tied to a plugin
@@ -237,69 +261,114 @@ public:
     static std::vector<std::string> availableRecTypeStrs();
 
     /**
-     * @brief Returns the default set of ModelRecordType values that are enabled for patching.
-     *
-     * @return Unordered set of default-enabled ModelRecordType values.
+     * @brief Returns the record types enabled for patching by default (every type except Unknown).
      */
     static std::unordered_set<ModelRecordType> defaultRecTypeSet();
 
     /**
-     * @brief Initializes the PGMutagen library for the given game and language.
+     * @brief Returns the record types DynDOLOD scans for full models (ACTI, CONT, DOOR, FURN, MSTT, STAT, TREE and
+     * GRAS): what the PGLite mode of the offline program patches, within the allowed record types.
+     */
+    static std::unordered_set<ModelRecordType> dynDOLODRecTypeSet();
+
+    /**
+     * @brief Initializes the PGMutagen library with the game's active load order.
      *
-     * Must be called before populateObjs(), modelUses(), or savePlugin().
+     * Must be called before populateObjs(), modelUses(), setModelUses() or savePlugin().
      *
-     * @param game The BethesdaGame instance providing game type and data path.
-     * @param exePath Path to the PGPatcher executable (for resolving relative paths).
-     * @param lang Plugin language to use when reading localized strings (default: ENGLISH).
+     * @param game The BethesdaGame instance providing game type, data path and active plugins.
+     * @param exePath Folder of the executable, where the .NET runtime resolves the PGMutagen assemblies.
+     * @param lang Plugin language to use when reading localized strings (default: PluginLang::English).
+     * @throws std::out_of_range for BethesdaGame::GameType::Unknown, std::runtime_error if the .NET runtime or the
+     * plugin environment fails to load.
      */
     static void initialize(const BethesdaGame& game,
                            const std::filesystem::path& exePath,
                            const PluginLang& lang = PluginLang::English);
 
     /**
-     * @brief Populates the internal object cache by reading all 3D model records from the loaded plugins.
+     * @brief Reads every model record of the load order (winning overrides) so modelUses() can answer, and captures the
+     * baseline resetPatchingState() returns to.
      *
-     * @param existingModPath Optional path to a pre-existing PGPatcher output plugin to merge with.
+     * @param existingModPath Path of the PGPatcher.esp of a previous run, if any. Its texture sets are carried over so
+     * texture sets created again get the same form IDs.
+     * @throws std::runtime_error if initialize() was not called or the plugins cannot be read.
      */
     static void populateObjs(const std::filesystem::path& existingModPath = { });
 
     /**
-     * @brief Resets plugin patching state to the baseline captured after populateObjs().
+     * @brief Resets plugin patching state to the baseline captured after populateObjs(). No-op before initialize().
      */
     static void resetPatchingState();
 
     /**
      * @brief Returns all plugin records that reference the given model path.
      *
-     * @param modelPath Wide-string relative model path (e.g., L"meshes\\foo\\bar.nif").
-     * @return Vector of (FormKey, MeshUseAttributes) pairs, sorted with weighted entries first.
+     * @param modelPath Relative model path (e.g., L"meshes\\foo\\bar.nif"), compared without regard to case.
+     * @return (FormKey, MeshUseAttributes) pairs: uses without alternate textures first, then weighted uses first, then
+     * by plugin name, form ID and sub model. Empty before initialize().
      */
     static std::vector<std::pair<PGMeshPermutationTracker::FormKey,
                                  MeshUseAttributes>>
     modelUses(const std::wstring& modelPath);
 
     /**
-     * @brief Updates plugin records with the patched mesh paths from all committed mesh results.
+     * @brief Updates the plugin records of every form key in the results with the output mesh path and the patched
+     * alternate textures. Dummy uses (no plugin) are skipped. No-op before initialize().
      *
      * @param meshResults List of MeshResult objects produced by PGMeshPermutationTracker::saveMeshes().
      */
     static void setModelUses(const std::vector<PGMeshPermutationTracker::MeshResult>& meshResults);
 
     /**
-     * @brief Saves the generated output plugin to the given directory.
+     * @brief Updates the OBND (Object Bounds) of plugin records with the bounds computed for each mesh result's
+     * primary model. Only TREE and GRAS records are updated: TexGen reads their OBND to decide which of them get LOD
+     * billboards, while the OBND of other types is often authored differently from the geometry. Results without
+     * bounds are skipped.
      *
-     * @param outputDir Directory in which to write the output plugin file.
+     * @param meshResults List of MeshResult objects produced by PGMeshPermutationTracker::saveMeshes().
+     */
+    static void setObjectBounds(const std::vector<PGMeshPermutationTracker::MeshResult>& meshResults);
+
+    /**
+     * @brief Whether any record has been overridden so far, by setModelUses() or setObjectBounds(). A run whose only
+     * changes are such overrides writes no file but the plugin.
+     *
+     * @return true if savePlugin() would write a plugin with an override. False before initialize().
+     */
+    [[nodiscard]] static bool hasModifiedRecords();
+
+    /**
+     * @brief Writes PGPatcher.esp (new texture sets) and PG_<n>.esp (overridden records, split by master count) to the
+     * given directory. Nothing is written when no record changed.
+     *
+     * @param outputDir Directory in which to write the output plugin files.
      * @param esmMode Which output plugins to ESM flag.
      */
     static void savePlugin(const std::filesystem::path& outputDir,
                            ESMMode esmMode);
 
+    /// @brief The stock records file of an output generated in PGLite mode, next to the plugins.
+    static constexpr const wchar_t* stockRecordsFile = L"PGPatcher_Stock.json";
+
     /**
-     * @brief Get the Plugin Path From Data Path object (removes textures or meshes from beginning of path)
+     * @brief Writes stockRecordsFile into the directory, after savePlugin(): for every record model the output plugins
+     * changed, the stock model path and alternate textures and the written ones, for every texture set record
+     * created, the stock texture set it replaced, and the textures the run generated, which PGLite leaves out of its
+     * inputs. PGLite puts the records back from it when the output is enabled. The file is written even when no
+     * record changed, since it marks the output as one PGLite accepts.
      *
-     * @param dataPath The data path to process
-     * @return std::filesystem::path The plugin path derived from the data path, or the original path if it does not
-     * start with "meshes" or "textures"
+     * @param outputDir Directory in which to write the file.
+     * @param generatedTextures Lower case data relative paths of the textures the run generated.
+     */
+    static void saveStockRecords(const std::filesystem::path& outputDir,
+                                 const std::vector<std::filesystem::path>& generatedTextures = { });
+
+    /**
+     * @brief Returns a data path the way plugins store it: without the leading "meshes" or "textures" folder
+     *
+     * @param dataPath Lower case path relative to the data folder
+     * @return The path without its first component, or the path itself if that is neither "meshes" nor "textures"
      */
     static std::filesystem::path pluginPathFromDataPath(const std::filesystem::path& dataPath);
 };

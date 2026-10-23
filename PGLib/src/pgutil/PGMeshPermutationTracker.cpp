@@ -1,11 +1,11 @@
 #include "pgutil/PGMeshPermutationTracker.hpp"
 
 #include "PGGlobals.hpp"
-#include "PGRunCache.hpp"
+#include "PGRunObserver.hpp"
+#include "pgutil/PGMaterialState.hpp"
 #include "pgutil/PGNIFUtil.hpp"
 #include "pgutil/PGTypes.hpp"
 #include "util/Logger.hpp"
-#include "util/StringUtil.hpp"
 
 #include "BasicTypes.hpp"
 #include "Geometry.hpp"
@@ -18,13 +18,15 @@
 #include <fmt/xchar.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -33,6 +35,71 @@
 #include <utility>
 #include <vector>
 
+namespace {
+
+/// @brief The box around the positions seen so far.
+struct BoundsAccumulator {
+    nifly::Vector3 min;
+    nifly::Vector3 max;
+    bool hasPositions = false;
+
+    /// @brief Adds a position, a position with a coordinate that is not a finite number is skipped.
+    void add(const nifly::Vector3& position)
+    {
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z))
+            return;
+
+        if (!hasPositions) {
+            min = position;
+            max = position;
+            hasPositions = true;
+            return;
+        }
+
+        min.x = std::min(min.x, position.x);
+        min.y = std::min(min.y, position.y);
+        min.z = std::min(min.z, position.z);
+        max.x = std::max(max.x, position.x);
+        max.y = std::max(max.y, position.y);
+        max.z = std::max(max.z, position.z);
+    }
+};
+
+/// @brief Adds the vertices of every shape below a node, in model space. Each block is visited once.
+void accumulateBounds(nifly::NifFile& nif,
+                      nifly::NiNode& node,
+                      const nifly::MatTransform& nodeToModel,
+                      std::unordered_set<const nifly::NiObject*>& visited,
+                      BoundsAccumulator& accumulator)
+{
+    for (auto* child : nif.GetChildren<nifly::NiAVObject>(&node)) {
+        if (!visited.insert(child).second)
+            continue;
+
+        const auto childToModel = nodeToModel.ComposeTransforms(child->GetTransformToParent());
+        if (auto* shape = dynamic_cast<nifly::NiShape*>(child)) {
+            const auto* vertices = PGNIFUtil::hasVertexPositions(shape) ? nif.GetVertsForShape(shape) : nullptr;
+            if (!vertices)
+                continue;
+
+            for (const auto& vertex : *vertices)
+                accumulator.add(childToModel.ApplyTransform(vertex));
+        } else if (auto* childNode = dynamic_cast<nifly::NiNode*>(child)) {
+            accumulateBounds(nif, *childNode, childToModel, visited, accumulator);
+        }
+    }
+}
+
+/// @brief The CRC32 of a file's bytes, as the trackers record it for the original mesh.
+unsigned long long crc32Of(const std::vector<std::byte>& bytes)
+{
+    boost::crc_32_type crc;
+    crc.process_bytes(bytes.data(), bytes.size());
+    return crc.checksum();
+}
+
+}
+
 PGMeshPermutationTracker::PGMeshPermutationTracker(const std::filesystem::path& origMeshPath)
     : m_origMeshPath(origMeshPath)
 {
@@ -40,6 +107,16 @@ PGMeshPermutationTracker::PGMeshPermutationTracker(const std::filesystem::path& 
     auto* pgd = PGGlobals::pgd();
     if (!pgd->isFile(origMeshPath))
         throw std::runtime_error("Original mesh path does not exist: " + origMeshPath.string());
+}
+
+PGMeshPermutationTracker::PGMeshPermutationTracker(std::filesystem::path origMeshPath,
+                                                   const std::vector<std::byte>& nifBytes)
+    : m_origMeshPath(std::move(origMeshPath))
+    , m_origNifFile(PGNIFUtil::loadNIFFromBytes(nifBytes,
+                                                false))
+    , m_origShapeIndices(get3dIndicesSet(&m_origNifFile))
+    , m_origCrc32(crc32Of(nifBytes))
+{
 }
 
 void PGMeshPermutationTracker::load()
@@ -89,11 +166,17 @@ nifly::NifFile* PGMeshPermutationTracker::stageMesh()
 
 void PGMeshPermutationTracker::ignoreBaseMesh() { m_ignoreBaseMesh = true; }
 
-bool PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
+std::optional<PGTypes::ObjectBounds> PGMeshPermutationTracker::originalObjectBounds()
+{
+    return computeObjectBounds(m_origNifFile);
+}
+
+auto PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
                                           bool isWeighted,
                                           const std::unordered_map<unsigned,
                                                                    PGTypes::TextureSet>& altTexResults,
-                                          const std::unordered_set<unsigned>& nonAltTexShapes)
+                                          const std::unordered_set<unsigned>& nonAltTexShapes,
+                                          bool shouldCompareWithOriginal) -> CommitResult
 {
     if (!m_stagedMeshPtr) {
         // No staged mesh to commit.
@@ -103,7 +186,7 @@ bool PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
     // Check if this form key already exists.
     if (m_processedFormKeys.contains(formKey)) {
         // Already exists.
-        return false;
+        return CommitResult::AlreadyProcessed;
     }
 
     // Add to processed form keys.
@@ -135,11 +218,12 @@ bool PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
             m_stagedMesh.Clear();
 
             // No need to continue.
-            return false;
+            return CommitResult::MergedIntoOutput;
         }
     }
 
-    if (m_outputMeshes.empty() && compareMesh(m_stagedMesh, m_origNifFile, nonAltTexShapes)) {
+    if (shouldCompareWithOriginal && m_outputMeshes.empty()
+        && compareMesh(m_stagedMesh, m_origNifFile, nonAltTexShapes)) {
         // Compare with base mesh to make sure we actually made changes.
         // If we are here there is a case where a record requires an unpatched base mesh. To avoid breaking this in the
         // future, we ignore base mesh which enforces that the base mesh is not patched.
@@ -147,7 +231,7 @@ bool PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
         m_stagedMeshPtr = nullptr;
         m_stagedMesh.Clear();
 
-        return false;
+        return CommitResult::UnchangedFromOriginal;
     }
 
     if (isWeighted) {
@@ -174,17 +258,14 @@ bool PGMeshPermutationTracker::commitMesh(const FormKey& formKey,
     m_stagedMesh.Clear();
     m_stagedMeshOriginal3DIdx.clear();
 
-    return true;
+    return CommitResult::Added;
 }
 
-auto PGMeshPermutationTracker::saveMeshes() -> std::pair<std::vector<MeshResult>,
-                                                         std::pair<unsigned long long,
-                                                                   unsigned long long>>
+auto PGMeshPermutationTracker::serializeMeshes(const bool& shouldUpdateBounds,
+                                               const bool& shouldComputeObjectBounds) -> std::vector<SerializedOutput>
 {
-    auto* pgd = PGGlobals::pgd();
-
-    std::vector<MeshResult> output;
-    unsigned long long baseCrc32 = 0;
+    std::vector<SerializedOutput> outputs;
+    outputs.reserve(m_outputMeshes.size());
 
     // Loop through output meshes.
     for (size_t i = 0; i < m_outputMeshes.size(); i++) {
@@ -235,32 +316,76 @@ auto PGMeshPermutationTracker::saveMeshes() -> std::pair<std::vector<MeshResult>
             meshResult.idxCorrections[missingShape] = -1; // shape was removed
 
         // Get filename of mesh.
-        const auto meshRelPath = meshPath(m_origMeshPath, curIndex);
-        meshResult.meshPath = meshRelPath;
-        const auto meshFilename = pgd->generatedPath() / meshRelPath;
+        meshResult.meshPath = meshPath(m_origMeshPath, curIndex);
+
+        // Recompute the bounding sphere of every shape, like NifSkope's "Update Bounds". Nothing after the patchers
+        // moves vertices, so doing it here once per output gives what doing it for every staged copy would.
+        if (shouldUpdateBounds) {
+            for (auto* shape : mesh.GetShapes())
+                if (PGNIFUtil::hasVertexPositions(shape))
+                    shape->UpdateBounds();
+        }
+
+        // Compute the mesh's bounding box for a later OBND update, before the buffer below is written.
+        if (shouldComputeObjectBounds)
+            meshResult.objectBounds = computeObjectBounds(mesh);
+
+        // Write to memory buffer.
+        std::ostringstream buffer(std::ios::binary);
+        if (mesh.Save(buffer, { .optimize = false, .sortBlocks = false })) {
+            // A mesh that we were able to open but cannot save will cause issues in-game because it might have
+            // partially saved.
+            Logger::critical(L"Unable to save NIF file {}", meshResult.meshPath.wstring());
+            return { };
+        }
+
+        SerializedOutput output { .result = meshResult, .bytes = buffer.str(), .blockKinds = blockTypeSignature(mesh) };
+        boost::crc_32_type crc;
+        crc.process_bytes(output.bytes.data(), output.bytes.size());
+        output.crc32 = crc.checksum();
+        outputs.push_back(std::move(output));
+    }
+
+    return outputs;
+}
+
+auto PGMeshPermutationTracker::saveMeshes(const bool& shouldUpdateBounds,
+                                          const bool& shouldComputeObjectBounds)
+    -> std::pair<std::vector<MeshResult>,
+                 std::pair<unsigned long long,
+                           unsigned long long>>
+{
+    auto* pgd = PGGlobals::pgd();
+
+    // Nothing is written over an existing output.
+    for (size_t i = 0; i < m_outputMeshes.size(); i++) {
+        const auto meshFilename = pgd->generatedPath() / meshPath(m_origMeshPath, m_ignoreBaseMesh ? i + 1 : i);
         if (std::filesystem::exists(meshFilename))
             throw std::runtime_error("Output mesh file already exists: " + meshFilename.string());
+    }
+
+    const auto serialized = serializeMeshes(shouldUpdateBounds, shouldComputeObjectBounds);
+    if (serialized.size() != m_outputMeshes.size()) {
+        // A mesh could not be serialized, which is logged.
+        return { };
+    }
+
+    std::vector<MeshResult> output;
+    unsigned long long baseCrc32 = 0;
+
+    for (size_t i = 0; i < serialized.size(); i++) {
+        const auto& curOutput = serialized.at(i);
+        const size_t curIndex = m_ignoreBaseMesh ? i + 1 : i;
+        const auto meshFilename = pgd->generatedPath() / curOutput.result.meshPath;
 
         // Create directories if required.
         std::filesystem::create_directories(meshFilename.parent_path());
 
-        // Save Mesh file.
-
-        // Write to memory buffer.
-        bool saveSuccess = false;
-        std::ostringstream buffer(std::ios::binary);
-        saveSuccess = (mesh.Save(buffer, { .optimize = false, .sortBlocks = false }) == 0);
-        const std::string& data = buffer.str();
-
-        if (curIndex == 0) {
-            // Get CRC32.
-            boost::crc_32_type crc;
-            crc.process_bytes(data.data(), data.size());
-            baseCrc32 = crc.checksum();
-        }
+        if (!curIndex)
+            baseCrc32 = curOutput.crc32;
 
         // Queue save to file saver.
-        PGGlobals::fileSaver().queueTask([data, meshFilename] {
+        PGGlobals::fileSaver().queueTask([data = curOutput.bytes, meshFilename] {
             std::ofstream file(meshFilename, std::ios::binary);
             if (file.is_open()) {
                 file.write(data.data(), static_cast<std::streamsize>(data.size()));
@@ -268,25 +393,18 @@ auto PGMeshPermutationTracker::saveMeshes() -> std::pair<std::vector<MeshResult>
             }
         });
 
-        if (saveSuccess) {
-            if (!curIndex)
-                Logger::debug("Saved patched base mesh");
-            else
-                Logger::debug("Saved patched duplicate mesh {}", std::to_string(curIndex));
-        } else {
-            // A mesh that we were able to open but cannot save will cause issues in-game because it might have
-            // partially saved.
-            Logger::critical(L"Unable to save NIF file {}", meshFilename.wstring());
-            return { };
-        }
+        if (!curIndex)
+            Logger::debug("Saved patched base mesh");
+        else
+            Logger::debug("Saved patched duplicate mesh {}", std::to_string(curIndex));
 
         // Tell PGD that this is a generated file.
-        pgd->addGeneratedFile(meshRelPath);
+        pgd->addGeneratedFile(curOutput.result.meshPath);
 
         // Record the output for incremental runs.
-        PGRunCache::recordOutputFile(meshRelPath, data.size());
+        PGRunObserver::current().recordOutputFile(curOutput.result.meshPath, curOutput.bytes.size());
 
-        output.push_back(meshResult);
+        output.push_back(curOutput.result);
     }
 
     if (m_ignoreBaseMesh)
@@ -296,6 +414,20 @@ auto PGMeshPermutationTracker::saveMeshes() -> std::pair<std::vector<MeshResult>
 }
 
 void PGMeshPermutationTracker::setRelaxWeightValidation(bool relax) { s_relaxWeightValidation = relax; }
+
+auto PGMeshPermutationTracker::blockTypeSignature(const nifly::NifFile& mesh) -> std::vector<BlockKind>
+{
+    std::vector<BlockKind> kinds;
+    for (auto* const block : comparableBlocks(&mesh))
+        if (dynamic_cast<nifly::NiParticleSystem*>(block))
+            kinds.push_back(BlockKind::ParticleSystem);
+        else if (dynamic_cast<nifly::BSTriShape*>(block))
+            kinds.push_back(BlockKind::TriShape);
+        else
+            kinds.push_back(BlockKind::Shape);
+
+    return kinds;
+}
 
 std::vector<std::pair<std::filesystem::path,
                       std::wstring>>
@@ -366,7 +498,9 @@ void PGMeshPermutationTracker::processWeightVariant(const nifly::NifFile& mesh,
 }
 
 //
-// ANY changes in patchers that involve WRITING new properties must be included in the equality operators below.
+// Lighting shaders, texture sets and alpha properties are compared through PGMaterialState, which lists every field of
+// the SSE mesh format. ANY changes in patchers that involve WRITING other properties (effect shaders, geometry) must be
+// included in the equality operators below.
 //
 
 bool PGMeshPermutationTracker::compareMesh(const nifly::NifFile& meshA,
@@ -472,6 +606,10 @@ bool PGMeshPermutationTracker::compareMesh(const nifly::NifFile& meshA,
             // NiShape.
             // Compare nishape helper.
             if (!compareNiShape(*shapeA, *shapeB))
+                return false;
+
+            // NiAlphaProperty.
+            if (!PGMaterialState::isAlphaPropertyEqual(meshA.GetAlphaProperty(shapeA), meshB.GetAlphaProperty(shapeB)))
                 return false;
 
             // Get shader properties.
@@ -586,47 +724,7 @@ bool PGMeshPermutationTracker::compareNiShape(const nifly::NiShape& shapeA,
 bool PGMeshPermutationTracker::compareBSLightingShaderProperty(const nifly::BSLightingShaderProperty& shaderA,
                                                                const nifly::BSLightingShaderProperty& shaderB)
 {
-    if (shaderA.emissiveColor != shaderB.emissiveColor)
-        return false;
-
-    if (shaderA.emissiveMultiple != shaderB.emissiveMultiple)
-        return false;
-
-    if (shaderA.alpha != shaderB.alpha)
-        return false;
-
-    if (shaderA.glossiness != shaderB.glossiness)
-        return false;
-
-    if (shaderA.specularColor != shaderB.specularColor)
-        return false;
-
-    if (shaderA.specularStrength != shaderB.specularStrength)
-        return false;
-
-    if (shaderA.softlighting != shaderB.softlighting)
-        return false;
-
-    if (shaderA.rimlightPower != shaderB.rimlightPower)
-        return false;
-
-    if (shaderA.subsurfaceColor.b != shaderB.subsurfaceColor.b || shaderA.subsurfaceColor.g != shaderB.subsurfaceColor.g
-        || shaderA.subsurfaceColor.r != shaderB.subsurfaceColor.r) {
-        return false;
-    }
-
-    if (shaderA.parallaxInnerLayerThickness != shaderB.parallaxInnerLayerThickness)
-        return false;
-
-    if (shaderA.parallaxRefractionScale != shaderB.parallaxRefractionScale)
-        return false;
-
-    if (shaderA.parallaxInnerLayerTextureScale.u != shaderB.parallaxInnerLayerTextureScale.u
-        || shaderA.parallaxInnerLayerTextureScale.v != shaderB.parallaxInnerLayerTextureScale.v) {
-        return false;
-    }
-
-    return true;
+    return PGMaterialState::isShaderEqual(shaderA, shaderB);
 }
 
 bool PGMeshPermutationTracker::compareBSEffectShaderProperty(const nifly::BSEffectShaderProperty& shaderA,
@@ -662,26 +760,7 @@ bool PGMeshPermutationTracker::compareBSShaderProperty(const nifly::BSShaderProp
 bool PGMeshPermutationTracker::compareBSShaderTextureSet(nifly::BSShaderTextureSet& texSetA,
                                                          nifly::BSShaderTextureSet& texSetB)
 {
-    auto texturesA = texSetA.textures;
-    auto texturesB = texSetB.textures;
-    const auto maxSize = std::max(texturesA.size(), texturesB.size());
-
-    for (uint32_t i = 0; i < maxSize; i++) {
-        const bool hasA = i < texturesA.size();
-        const bool hasB = i < texturesB.size();
-
-        if (hasA && hasB) {
-            if (!StringUtil::asciiFastIEquals(texturesA[i].get(), texturesB[i].get()))
-                return false;
-        } else if (hasA) {
-            if (!texturesA[i].get().empty())
-                return false;
-        } else { // hasB
-            if (!texturesB[i].get().empty())
-                return false;
-        }
-    }
-    return true;
+    return PGMaterialState::isTextureSetEqual(texSetA, texSetB);
 }
 
 std::filesystem::path PGMeshPermutationTracker::meshPath(const std::filesystem::path& nifPath,
@@ -698,6 +777,37 @@ std::filesystem::path PGMeshPermutationTracker::meshPath(const std::filesystem::
         newNIFPath /= *it++;
 
     return newNIFPath;
+}
+
+std::optional<PGTypes::ObjectBounds> PGMeshPermutationTracker::computeObjectBounds(nifly::NifFile& nif)
+{
+    constexpr auto int16Min = static_cast<float>(std::numeric_limits<int16_t>::min());
+    constexpr auto int16Max = static_cast<float>(std::numeric_limits<int16_t>::max());
+
+    auto* root = nif.GetRootNode();
+    if (!root)
+        return std::nullopt;
+
+    // Walk down from the root, like the game places the shapes: only what hangs below the root counts, each block is
+    // visited once so a mesh whose blocks list each other cannot loop, and the transforms compose from the top.
+    BoundsAccumulator accumulator;
+    std::unordered_set<const nifly::NiObject*> visited { root };
+    accumulateBounds(nif, *root, root->GetTransformToParent(), visited, accumulator);
+
+    if (!accumulator.hasPositions)
+        return std::nullopt;
+
+    // OBND stores each corner as a signed 16-bit integer. The Creation Kit truncates toward zero (verified against
+    // vanilla records, e.g. -380.78 -> -380 and 313.70 -> 313), so do the same to match it. Clamp in the (extremely
+    // unlikely) case a mesh exceeds the representable range.
+    const auto toInt16 = [int16Min, int16Max](const float value) {
+        return static_cast<int16_t>(std::clamp(std::trunc(value), int16Min, int16Max));
+    };
+
+    PGTypes::ObjectBounds bounds;
+    bounds.min = { toInt16(accumulator.min.x), toInt16(accumulator.min.y), toInt16(accumulator.min.z) };
+    bounds.max = { toInt16(accumulator.max.x), toInt16(accumulator.max.y), toInt16(accumulator.max.z) };
+    return bounds;
 }
 
 std::vector<nifly::NiObject*> PGMeshPermutationTracker::comparableBlocks(const nifly::NifFile* nif)

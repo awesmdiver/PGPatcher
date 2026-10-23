@@ -9,6 +9,7 @@
 #include "common/BethesdaDirectory.hpp"
 #include "patchers/PatcherTextureHookConvertToCM.hpp"
 #include "patchers/PatcherTextureHookFixSSS.hpp"
+#include "patchers/base/PatcherTextureHook.hpp"
 #include "pgutil/PGEnums.hpp"
 #include "pgutil/PGMeshPermutationTracker.hpp"
 #include "pgutil/PGNIFUtil.hpp"
@@ -226,6 +227,7 @@ void writeUses(BinaryIO::Writer& w,
         flags |= attrs.isFacegen ? 4U : 0U;
         flags |= attrs.isIgnored ? 8U : 0U;
         flags |= attrs.isDummyUse ? 16U : 0U;
+        flags |= attrs.isBodySlideShapeData ? 32U : 0U;
         w.write<uint8_t>(flags);
         w.write<uint8_t>(static_cast<uint8_t>(attrs.recType));
 
@@ -253,6 +255,7 @@ PGRunCache::MeshUses readUses(BinaryIO::Reader& r,
         attrs.isFacegen = (flags & 4U) != 0U;
         attrs.isIgnored = (flags & 8U) != 0U;
         attrs.isDummyUse = (flags & 16U) != 0U;
+        attrs.isBodySlideShapeData = (flags & 32U) != 0U;
         attrs.recType = static_cast<PGPlugin::ModelRecordType>(r.read<uint8_t>());
 
         const auto altCount = readCount<size_t>(r, 8);
@@ -309,6 +312,14 @@ void writeMeshResult(BinaryIO::Writer& w,
 
     writeIntMap(w, result.idxCorrections);
     writeIntMap(w, result.inverseIdxCorrectionsPatching);
+
+    w.writeBool(result.objectBounds.has_value());
+    if (result.objectBounds) {
+        for (const auto& value : result.objectBounds->min)
+            w.write<int16_t>(value);
+        for (const auto& value : result.objectBounds->max)
+            w.write<int16_t>(value);
+    }
 }
 
 PGMeshPermutationTracker::MeshResult readMeshResult(BinaryIO::Reader& r,
@@ -331,6 +342,16 @@ PGMeshPermutationTracker::MeshResult readMeshResult(BinaryIO::Reader& r,
 
     result.idxCorrections = readIntMap(r);
     result.inverseIdxCorrectionsPatching = readIntMap(r);
+
+    if (r.readBool()) {
+        PGTypes::ObjectBounds bounds;
+        for (auto& value : bounds.min)
+            value = r.read<int16_t>();
+        for (auto& value : bounds.max)
+            value = r.read<int16_t>();
+        result.objectBounds = bounds;
+    }
+
     return result;
 }
 
@@ -718,19 +739,6 @@ std::wstring PGRunCache::pathKey(const std::wstring& path)
 
 std::wstring PGRunCache::pathKey(const std::filesystem::path& path) { return pathKey(path.wstring()); }
 
-std::filesystem::path PGRunCache::hookOutputPath(const HookKind& kind,
-                                                 const std::filesystem::path& texPath)
-{
-    switch (kind) {
-    case HookKind::ConvertToCM:
-        return PatcherTextureHookConvertToCM::outputFilename(texPath);
-    case HookKind::FixSSS:
-        return PatcherTextureHookFixSSS::outputFilename(texPath);
-    }
-
-    return { };
-}
-
 uint64_t PGRunCache::hashTexMatchResults(const std::vector<PGTypes::PGTexture>& results)
 {
     std::vector<std::pair<std::wstring, PGEnums::TextureType>> sorted;
@@ -770,6 +778,8 @@ void PGRunCache::captureLogMessage(spdlog::level::level_enum level,
 PGRunCache::MeshRecorder::MeshRecorder(std::filesystem::path nifPath)
     : m_nifPath(std::move(nifPath))
 {
+    installObserver();
+
     if (s_activeRecorder)
         throw std::runtime_error("Nested mesh recorders are not supported");
 
@@ -824,10 +834,10 @@ void PGRunCache::MeshRecorder::recordTextureType(const std::filesystem::path& pa
 
 void PGRunCache::MeshRecorder::recordTextureAttribute(const std::filesystem::path& path,
                                                       const PGEnums::TextureAttribute& attribute,
-                                                      bool value)
+                                                      bool hasAttribute)
 {
     if (m_textureAttributeDeps.insert(pathKey(path) + L'|' + std::to_wstring(static_cast<int>(attribute))).second)
-        m_record.textureAttributeDeps.emplace_back(path.wstring(), attribute, value);
+        m_record.textureAttributeDeps.emplace_back(path.wstring(), attribute, hasAttribute);
 }
 
 void PGRunCache::MeshRecorder::recordTextureAttributes(const std::filesystem::path& path,
@@ -976,25 +986,124 @@ void PGRunCache::MeshRecorder::commit()
 }
 
 //
-// SuspendRecording.
+// Lifecycle.
 //
 
-PGRunCache::SuspendRecording::SuspendRecording() { s_suspendDepth++; }
+void PGRunCache::Observer::recordTextureType(const std::filesystem::path& path,
+                                             const PGEnums::TextureType& type)
+{
+    PGRunCache::recordTextureType(path, type);
+}
 
-PGRunCache::SuspendRecording::~SuspendRecording()
+void PGRunCache::Observer::recordTextureAttribute(const std::filesystem::path& path,
+                                                  const PGEnums::TextureAttribute& attribute,
+                                                  bool hasAttribute)
+{
+    PGRunCache::recordTextureAttribute(path, attribute, hasAttribute);
+}
+
+void PGRunCache::Observer::recordTextureAttributes(const std::filesystem::path& path,
+                                                   const std::unordered_set<PGEnums::TextureAttribute>& attributes)
+{
+    PGRunCache::recordTextureAttributes(path, attributes);
+}
+
+void PGRunCache::Observer::recordTexMatch(const std::wstring& base,
+                                          const PGEnums::TextureType& type,
+                                          const std::vector<PGTypes::PGTexture>& results)
+{
+    PGRunCache::recordTexMatch(base, type, results);
+}
+
+void PGRunCache::Observer::recordModOfFile(const std::filesystem::path& path,
+                                           const std::wstring& modName)
+{
+    PGRunCache::recordModOfFile(path, modName);
+}
+
+void PGRunCache::Observer::recordMatches(const PGTypes::TextureSet& slots,
+                                         bool isSinglepassMATO,
+                                         const PGPlugin::ModelRecordType& recType,
+                                         uint64_t digest)
+{
+    PGRunCache::recordMatches(slots, isSinglepassMATO, recType, digest);
+}
+
+void PGRunCache::Observer::recordOutputFile(const std::filesystem::path& relPath,
+                                            uint64_t size)
+{
+    PGRunCache::recordOutputFile(relPath, size);
+}
+
+void PGRunCache::Observer::recordHookRegistration(const HookKind& kind,
+                                                  const std::filesystem::path& texPath)
+{
+    PGRunCache::recordHookRegistration(kind, texPath);
+}
+
+bool PGRunCache::Observer::tryReuseHookOutput(const HookKind& kind,
+                                              const std::filesystem::path& texPath)
+{
+    return PGRunCache::tryReuseHookOutput(kind, texPath);
+}
+
+void PGRunCache::Observer::recordHookOutput(const HookKind& kind,
+                                            const std::filesystem::path& source,
+                                            const std::filesystem::path& output)
+{
+    PGRunCache::recordHookOutput(kind, source, output);
+}
+
+void PGRunCache::Observer::suspendRecording() { s_suspendDepth++; }
+
+void PGRunCache::Observer::resumeRecording()
 {
     if (s_suspendDepth > 0)
         s_suspendDepth--;
 }
 
-//
-// Lifecycle.
-//
+bool PGRunCache::Observer::tryGetCachedMeshVotes(const std::filesystem::path& nifPath,
+                                                 const BethesdaDirectory::FileIdentity& identity,
+                                                 std::vector<PGTypes::TextureVote>& votes)
+{
+    return PGRunCache::tryGetCachedMeshVotes(nifPath, identity, votes);
+}
+
+void PGRunCache::Observer::storeMeshVotes(const std::filesystem::path& nifPath,
+                                          const BethesdaDirectory::FileIdentity& identity,
+                                          const std::vector<PGTypes::TextureVote>& votes)
+{
+    PGRunCache::storeMeshVotes(nifPath, identity, votes);
+}
+
+bool PGRunCache::Observer::tryGetCachedMeshUses(const std::filesystem::path& nifPath,
+                                                MeshUses& uses)
+{
+    return PGRunCache::tryGetCachedMeshUses(nifPath, uses);
+}
+
+bool PGRunCache::Observer::tryGetCachedCMClassification(const std::filesystem::path& texture,
+                                                        const BethesdaDirectory::FileIdentity& identity,
+                                                        PGTypes::CMClassification& result)
+{
+    return PGRunCache::tryGetCachedCMClassification(texture, identity, result);
+}
+
+void PGRunCache::Observer::storeCMClassification(const std::filesystem::path& texture,
+                                                 const BethesdaDirectory::FileIdentity& identity,
+                                                 const PGTypes::CMClassification& result)
+{
+    PGRunCache::storeCMClassification(texture, identity, result);
+}
+
+void PGRunCache::installObserver() { PGRunObserver::install(&s_observer); }
 
 void PGRunCache::initialize(const std::filesystem::path& cacheFile,
                             bool enabled,
                             bool ignoreExisting)
 {
+    installObserver();
+
     s_cacheFile = cacheFile;
     s_enabled = enabled;
     s_previous.reset();
@@ -1189,7 +1298,7 @@ auto PGRunCache::collectOutputIdentities() -> std::unordered_map<std::wstring,
     std::unordered_map<std::wstring, OutputIdentity> identities;
 
     const auto generatedPath = outputRoot();
-    for (const auto& folder : { L"meshes", L"textures" }) {
+    for (const auto& folder : { L"meshes", L"textures", L"calientetools" }) {
         const auto folderPath = generatedPath / folder;
         std::error_code ec;
         if (!std::filesystem::is_directory(folderPath, ec))
@@ -1466,10 +1575,10 @@ void PGRunCache::recordTextureType(const std::filesystem::path& path,
 
 void PGRunCache::recordTextureAttribute(const std::filesystem::path& path,
                                         const PGEnums::TextureAttribute& attribute,
-                                        bool value)
+                                        bool hasAttribute)
 {
     if (isRecording())
-        s_activeRecorder->recordTextureAttribute(path, attribute, value);
+        s_activeRecorder->recordTextureAttribute(path, attribute, hasAttribute);
 }
 
 void PGRunCache::recordTextureAttributes(const std::filesystem::path& path,
@@ -1606,7 +1715,7 @@ bool PGRunCache::evaluateMesh(const std::filesystem::path& nifPath,
     // is satisfied by replaying the registrations.
     std::unordered_set<std::wstring> ownHookOutputs;
     for (const auto& [kind, tex] : record.hookRegistrations)
-        ownHookOutputs.insert(pathKey(hookOutputPath(kind, tex)));
+        ownHookOutputs.insert(pathKey(PatcherTextureHook::outputPathOf(kind, tex)));
 
     // File existence.
     for (const auto& [path, state] : record.fileExistsDeps) {
@@ -1840,6 +1949,7 @@ void PGRunCache::pruneStaleOutputs(const std::unordered_set<std::filesystem::pat
 
     removeEmptyDirectories(generatedPath / "meshes");
     removeEmptyDirectories(generatedPath / "textures");
+    removeEmptyDirectories(generatedPath / "calientetools");
 
     Logger::info("Update cache: removed {} stale output files", removed);
 }
@@ -1900,7 +2010,7 @@ bool PGRunCache::tryReuseHookOutput(const HookKind& kind,
     if (!hasPreviousRun())
         return false;
 
-    const auto output = hookOutputPath(kind, texPath);
+    const auto output = PatcherTextureHook::outputPathOf(kind, texPath);
     const auto outputKey = pathKey(output);
     const auto sourceKey = pathKey(texPath);
 
@@ -1960,7 +2070,7 @@ void PGRunCache::finalizeHooks()
 
         for (const auto& [mesh, record] : s_currentRecords)
             for (const auto& [kind, tex] : record.hookRegistrations)
-                needed.insert(pathKey(hookOutputPath(kind, tex)));
+                needed.insert(pathKey(PatcherTextureHook::outputPathOf(kind, tex)));
     }
 
     // Replay the texture map side effects of reused outputs.

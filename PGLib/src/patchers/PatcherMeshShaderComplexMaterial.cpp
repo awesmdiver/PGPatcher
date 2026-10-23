@@ -63,7 +63,7 @@ PatcherMeshShaderComplexMaterial::PatcherMeshShaderComplexMaterial(std::filesyst
 }
 
 bool PatcherMeshShaderComplexMaterial::canApply(nifly::NiShape& nifShape,
-                                                [[maybe_unused]] bool isSinglepassMATO,
+                                                bool isSinglepassMATO,
                                                 const PGPlugin::ModelRecordType& modelRecordType)
 {
     if (modelRecordType == PGPlugin::ModelRecordType::Grass) {
@@ -74,6 +74,10 @@ bool PatcherMeshShaderComplexMaterial::canApply(nifly::NiShape& nifShape,
     // Prep.
     auto* nifShader = nif()->GetShader(&nifShape);
     const auto* const nifShaderBSLSP = dynamic_cast<nifly::BSLightingShaderProperty*>(nifShader);
+    if (!nifShaderBSLSP) {
+        // Only lighting shaders can be complex material.
+        return false;
+    }
 
     // Get NIFShader type.
     const auto nifShaderType = static_cast<nifly::BSLightingShaderPropertyShaderType>(nifShader->GetShaderType());
@@ -108,7 +112,7 @@ bool PatcherMeshShaderComplexMaterial::shouldApply(nifly::NiShape& nifShape,
                                                    std::vector<PatcherMatch>& matches)
 {
     // Check for CM matches.
-    return shouldApply(textureSet(nifPath(), *nif(), nifShape), matches);
+    return shouldApply(PGNIFUtil::textureSlots(nif(), &nifShape), matches);
 }
 
 bool PatcherMeshShaderComplexMaterial::shouldApply(const PGTypes::TextureSet& oldSlots,
@@ -117,7 +121,9 @@ bool PatcherMeshShaderComplexMaterial::shouldApply(const PGTypes::TextureSet& ol
     auto* pgd = PGGlobals::pgd();
     auto* pgd3d = PGGlobals::pgD3D();
 
-    static const auto cmBaseMap = pgd->textureMapConst(PGEnums::TextureSlots::EnvMask);
+    // The live map of the current directory. It only holds mapped textures: the texture hooks do not add the maps they
+    // generate, which are reached through the Parallax to CM transform instead.
+    const auto& cmBaseMap = pgd->textureMapConst(PGEnums::TextureSlots::EnvMask);
 
     matches.clear();
 
@@ -174,6 +180,8 @@ void PatcherMeshShaderComplexMaterial::applyPatch(PGTypes::TextureSet& slots,
     applyShader(nifShape);
     auto* nifShader = nif()->GetShader(&nifShape);
     auto* const nifShaderBSLSP = dynamic_cast<nifly::BSLightingShaderProperty*>(nifShader);
+    if (!nifShaderBSLSP)
+        return;
 
     // Check if specular should be white.
     if (pgd->hasTextureAttribute(match.matchedPath, PGEnums::TextureAttribute::CMMetalness)) {
@@ -198,8 +206,9 @@ void PatcherMeshShaderComplexMaterial::applyPatch(PGTypes::TextureSet& slots,
         }
 
         // "specular_color" attribute.
-        if (meta.contains("specular_color") && meta["specular_color"].is_array()
-            && meta["specular_color"].size() == 3) {
+        if (meta.contains("specular_color") && meta["specular_color"].is_array() && meta["specular_color"].size() == 3
+            && meta["specular_color"][0].is_number() && meta["specular_color"][1].is_number()
+            && meta["specular_color"][2].is_number()) {
             const auto specColor = meta["specular_color"];
             PGNIFUtil::setShaderFloat(nifShaderBSLSP->specularColor.x, specColor[0].get<float>());
             PGNIFUtil::setShaderFloat(nifShaderBSLSP->specularColor.y, specColor[1].get<float>());
@@ -252,6 +261,8 @@ void PatcherMeshShaderComplexMaterial::applyShader(nifly::NiShape& nifShape)
 {
     auto* nifShader = nif()->GetShader(&nifShape);
     auto* const nifShaderBSLSP = dynamic_cast<nifly::BSLightingShaderProperty*>(nifShader);
+    if (!nifShaderBSLSP)
+        return;
 
     // Set NIFShader type to env map.
     PGNIFUtil::setShaderType(nifShader, nifly::BSLSP_ENVMAP);

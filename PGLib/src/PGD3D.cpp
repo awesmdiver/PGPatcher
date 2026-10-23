@@ -2,28 +2,29 @@
 
 #include "PGDirectory.hpp"
 #include "PGGlobals.hpp"
-#include "PGRunCache.hpp"
+#include "PGRunObserver.hpp"
 #include "util/Logger.hpp"
 
+#include "CountAlphaValues.h"
 #include <DirectXMath.h>
 #include <DirectXTex.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <comdef.h>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <d3d11.h>
 #include <d3dcommon.h>
-#include <d3dcompiler.h>
-#include <dxcapi.h>
 #include <dxgi.h>
 #include <dxgiformat.h>
 #include <filesystem>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -37,11 +38,6 @@ using Microsoft::WRL::ComPtr;
 // We need to access unions as part of certain DX11 structures.
 // Reinterpret cast is needed often for type casting with DX11.
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access,cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
-
-PGD3D::PGD3D(std::filesystem::path shaderPath)
-    : m_shaderPath(std::move(shaderPath))
-{
-}
 
 bool PGD3D::checkIfCM(const std::filesystem::path& ddsPath,
                       bool& result,
@@ -280,45 +276,24 @@ bool PGD3D::initGPU()
 bool PGD3D::initShaders()
 {
     // Initialize shaders.
-    return initShader("CountAlphaValues.hlsl", m_shaderCountAlphaValues);
+    return initShader(ShaderBytecode(g_CountAlphaValues), m_shaderCountAlphaValues);
 }
 
-bool PGD3D::initShader(const std::filesystem::path& filename,
+bool PGD3D::initShader(ShaderBytecode bytecode,
                        ComPtr<ID3D11ComputeShader>& outShader)
 {
     if (!m_ptrDevice)
         throw std::runtime_error("GPU not initialized");
 
-    // Load shader.
-    ComPtr<ID3DBlob> shaderBlob;
-    HRESULT hr { };
-#ifdef _DEBUG
-    const DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG;
-#else
-    const DWORD dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
-#endif
-
-    const std::filesystem::path shaderAbsPath = m_shaderPath / filename;
-
-    // Compile shader.
-    ComPtr<ID3DBlob> ptrErrorBlob;
-    hr = D3DCompileFromFile(shaderAbsPath.c_str(),
-                            nullptr,
-                            nullptr,
-                            "main",
-                            "cs_5_0",
-                            dwShaderFlags,
-                            0,
-                            shaderBlob.ReleaseAndGetAddressOf(),
-                            ptrErrorBlob.ReleaseAndGetAddressOf());
-    if (FAILED(hr))
+    if (bytecode.empty())
         return false;
 
     // Create compute shader on GPU.
+    HRESULT hr { };
     {
         const std::scoped_lock lock(m_d3dMutex);
         hr = m_ptrDevice->CreateComputeShader(
-            shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize(), nullptr, outShader.ReleaseAndGetAddressOf());
+            bytecode.data(), bytecode.size(), nullptr, outShader.ReleaseAndGetAddressOf());
     }
     return !FAILED(hr);
 }
@@ -831,7 +806,7 @@ bool PGD3D::getDDS(const std::filesystem::path& ddsPath, // NOLINT(readability-c
 
     // Texture pixel data never influences mesh output directly (only derived classification does), so reading it
     // must not register the texture as a dependency of the mesh being patched.
-    const PGRunCache::SuspendRecording suspendRecording;
+    const PGRunObserver::SuspendRecording suspendRecording;
 
     HRESULT hr { };
 
@@ -877,6 +852,42 @@ PGD3D::ddsMetadataCacheSnapshot()
     return m_ddsMetaDataCache;
 }
 
+bool PGD3D::isFileReadError(HRESULT hr)
+{
+    // DirectXTex returns the Win32 error of a file it could not open or read, and reports a file that is no DDS file
+    // with E_FAIL or with the Win32 codes below. A file that is not there is not a read failure either: like a path
+    // the engine cannot resolve at runtime, it is missing, not refused. Every other Win32 code is the file system's.
+    if (HRESULT_FACILITY(hr) != FACILITY_WIN32)
+        return false;
+
+    switch (HRESULT_CODE(hr)) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DATA:
+    case ERROR_NOT_SUPPORTED:
+    case ERROR_HANDLE_EOF:
+    case ERROR_FILE_TOO_LARGE:
+    case ERROR_ARITHMETIC_OVERFLOW:
+    case ERROR_CANNOT_MAKE:
+        return false;
+    default:
+        return true;
+    }
+}
+
+void PGD3D::rememberDDSMetadataFailure(const std::filesystem::path& ddsPath,
+                                       bool isReadFailure)
+{
+    const std::unique_lock lock(m_ddsMetaDataMutex);
+    m_ddsMetaDataFailures[ddsPath] = { .time = std::chrono::steady_clock::now(), .isReadFailure = isReadFailure };
+}
+
+void PGD3D::setDDSMetadataRetryInterval(std::chrono::steady_clock::duration interval)
+{
+    const std::unique_lock lock(m_ddsMetaDataMutex);
+    m_ddsMetadataRetryInterval = interval;
+}
+
 bool PGD3D::getDDSMetadata(const std::filesystem::path& ddsPath,
                            DirectX::TexMetadata& ddsMeta)
 {
@@ -884,44 +895,71 @@ bool PGD3D::getDDSMetadata(const std::filesystem::path& ddsPath,
 
     {
         const std::shared_lock lock(m_ddsMetaDataMutex);
-        // FIXME: Set the cache to something on failure.
-        if (m_ddsMetaDataCache.contains(ddsPath)) {
-            ddsMeta = m_ddsMetaDataCache.at(ddsPath);
+        const auto cached = m_ddsMetaDataCache.find(ddsPath);
+        if (cached != m_ddsMetaDataCache.end()) {
+            ddsMeta = cached->second;
             return true;
+        }
+
+        // A failure is remembered for the retry interval, so a burst of lookups does not read a failing file for each
+        // of them. Afterwards the file is read again: the failure may have been the disk's, or the engine's in
+        // PGLite, at the time. A file that could not be read at all is reported at every lookup, so whatever patch
+        // asked knows its result is not the one a later read would give.
+        const auto failed = m_ddsMetaDataFailures.find(ddsPath);
+        if (failed != m_ddsMetaDataFailures.end()
+            && std::chrono::steady_clock::now() - failed->second.time < m_ddsMetadataRetryInterval) {
+            if (failed->second.isReadFailure)
+                PGRunObserver::current().recordTextureReadFailure(ddsPath);
+
+            return false;
         }
     }
 
     // See getDDS for why recording is suspended here.
-    const PGRunCache::SuspendRecording suspendRecording;
+    const PGRunObserver::SuspendRecording suspendRecording;
 
-    HRESULT hr { };
+    HRESULT hr = E_FAIL;
+    bool isReadFailure = false;
 
     if (pgd->isLooseFile(ddsPath)) {
         const std::filesystem::path fullPath = pgd->looseFileFullPath(ddsPath);
 
         // Load DDS file.
         hr = DirectX::GetMetadataFromDDSFile(fullPath.c_str(), DirectX::DDS_FLAGS_NONE, ddsMeta);
+        isReadFailure = FAILED(hr) && isFileReadError(hr);
     } else if (pgd->isBSAFile(ddsPath)) {
         std::vector<std::byte> ddsBytes;
         try {
             ddsBytes = pgd->file(ddsPath);
-        } catch (...) {
-            Logger::error(L"Failed to read DDS file from BSA: {}", ddsPath.wstring());
-            return false;
-        }
 
-        // Load DDS file.
-        hr = DirectX::GetMetadataFromDDSMemory(ddsBytes.data(), ddsBytes.size(), DirectX::DDS_FLAGS_NONE, ddsMeta);
+            // Load DDS file.
+            hr = DirectX::GetMetadataFromDDSMemory(ddsBytes.data(), ddsBytes.size(), DirectX::DDS_FLAGS_NONE, ddsMeta);
+        } catch (const BethesdaDirectory::ReadFailure&) {
+            // The reader could not read a file that is there (the PGLite runtime reading through the engine): the
+            // lookup that asked may try again later.
+            Logger::error(L"Failed to read DDS file from BSA: {}", ddsPath.wstring());
+            isReadFailure = true;
+        } catch (...) {
+            // Not readable at all: remembered like a file that is no DDS.
+            Logger::error(L"Failed to read DDS file from BSA: {}", ddsPath.wstring());
+        }
     } else {
+        // Not in the load order: nothing to remember, the lookup will not find it next time either.
         return false;
     }
 
-    if (FAILED(hr))
+    if (isReadFailure || FAILED(hr)) {
+        rememberDDSMetadataFailure(ddsPath, isReadFailure);
+        if (isReadFailure)
+            PGRunObserver::current().recordTextureReadFailure(ddsPath);
+
         return false;
+    }
 
     // Update cache.
     {
         const std::unique_lock lock(m_ddsMetaDataMutex);
+        m_ddsMetaDataFailures.erase(ddsPath);
         if (!m_ddsMetaDataCache.contains(ddsPath))
             m_ddsMetaDataCache[ddsPath] = ddsMeta;
     }

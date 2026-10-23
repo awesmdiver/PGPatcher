@@ -2,14 +2,16 @@
 
 #include "PGD3D.hpp"
 #include "PGGlobals.hpp"
+#include "PGModManager.hpp"
 #include "PGPlugin.hpp"
-#include "PGRunCache.hpp"
+#include "PGRunObserver.hpp"
 #include "common/BethesdaDirectory.hpp"
 #include "common/BethesdaGame.hpp"
 #include "pgutil/PGEnums.hpp"
 #include "pgutil/PGMeshPermutationTracker.hpp"
 #include "pgutil/PGNIFUtil.hpp"
 #include "pgutil/PGTypes.hpp"
+#include "util/FileUtil.hpp"
 #include "util/Logger.hpp"
 #include "util/StringUtil.hpp"
 #include "util/TaskPoolRunner.hpp"
@@ -21,10 +23,9 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/asio.hpp>
 #include <boost/crc.hpp>
-#include <boost/thread.hpp>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <spdlog/spdlog.h>
 
@@ -44,6 +45,24 @@
 #include <utility>
 #include <vector>
 #include <winnt.h>
+
+namespace {
+
+/// @brief The shader a mapped texture gives its mod: parallax for a height map, complex material for a complex material
+/// map, the default shader for every other type.
+PGEnums::ShapeShader shaderOfTextureType(PGEnums::TextureType type)
+{
+    switch (type) {
+    case PGEnums::TextureType::Height:
+        return PGEnums::ShapeShader::VanillaParallax;
+    case PGEnums::TextureType::ComplexMaterial:
+        return PGEnums::ShapeShader::ComplexMaterial;
+    default:
+        return PGEnums::ShapeShader::None;
+    }
+}
+
+}
 
 PGDirectory::PGDirectory(BethesdaGame* bg,
                          std::filesystem::path outputPath)
@@ -76,7 +95,8 @@ void PGDirectory::findFiles()
 
     for (const auto& [path, file] : fileMap) {
         const auto& firstPath = path.begin()->wstring();
-        if (boost::iequals(firstPath, "textures") && boost::iequals(path.extension().wstring(), L".dds")) {
+        const auto extension = path.extension().wstring();
+        if (boost::iequals(firstPath, "textures") && boost::iequals(extension, L".dds")) {
             if (!isPathAscii(path)) {
                 // Skip non-ascii paths.
                 Logger::warn(L"Texture {} contains non-ascii characters which are not allowed", path.wstring());
@@ -86,18 +106,25 @@ void PGDirectory::findFiles()
             // Found a DDS.
             Logger::trace(
                 L"Found texture: {} / {}", path.wstring(), !file.bsaFile ? L"" : file.bsaFile->path.wstring());
-            m_unconfirmedTextures[path] = { };
+            m_unconfirmedTextures.try_emplace(path);
 
             {
                 // Add to textures set.
                 const std::unique_lock lock(m_texturesMutex);
                 m_textures.insert(path);
             }
-        } else if (boost::iequals(firstPath, "meshes") && boost::iequals(path.extension().wstring(), L".nif")) {
+        } else if (boost::iequals(firstPath, "meshes") && boost::iequals(extension, L".nif")) {
             // Found a NIF.
             Logger::trace(L"Found mesh: {} / {}", path.wstring(), !file.bsaFile ? L"" : file.bsaFile->path.wstring());
             m_unconfirmedMeshes.insert(path);
-        } else if (boost::iequals(path.extension().wstring(), L".json")) {
+        } else if (boost::iequals(extension, L".nif") && PGNIFUtil::isBodySlideShapeDataMesh(path)) {
+            // Found a BodySlide ShapeData NIF. BodySlide builds its output meshes from these, so they are patched like
+            // any other mesh.
+            Logger::trace(L"Found BodySlide ShapeData mesh: {} / {}",
+                          path.wstring(),
+                          !file.bsaFile ? L"" : file.bsaFile->path.wstring());
+            m_unconfirmedMeshes.insert(path);
+        } else if (boost::iequals(extension, L".json")) {
             // Found a JSON file.
             if (boost::iequals(firstPath, L"pbrnifpatcher")) {
                 // Found PBR JSON config.
@@ -125,7 +152,8 @@ void PGDirectory::waitForMeshMapping()
         return;
     }
 
-    if (m_meshUseMappingQueue.isProcessing()) {
+    // Wait while a task runs or is still queued; shutdown() drops queued tasks.
+    if (m_meshUseMappingQueue.isWorking()) {
         Logger::info("Waiting for plugin mesh use mapping to complete...");
         m_meshUseMappingQueue.waitForCompletion();
     }
@@ -141,7 +169,8 @@ void PGDirectory::waitForCMClassification()
         return;
     }
 
-    if (m_cmClassificationQueue.isProcessing()) {
+    // Wait while a task runs or is still queued; shutdown() drops queued tasks.
+    if (m_cmClassificationQueue.isWorking()) {
         Logger::info("Waiting for extended texture classification to complete...");
         m_cmClassificationQueue.waitForCompletion();
     }
@@ -161,9 +190,16 @@ void PGDirectory::mapFiles(const std::vector<std::wstring>& nifBlocklist,
 {
     findFiles();
 
-    // Helpers.
-    const std::unordered_map<std::wstring, PGEnums::TextureType> manualTextureMapsMap(manualTextureMaps.begin(),
-                                                                                      manualTextureMaps.end());
+    // The rules are matched against the mapped paths, which are lower case with backslashes, whatever form they were
+    // typed in (the settings file, the launcher's dialog or the PGLite menu). The first of two equal rules wins, as
+    // it did before.
+    std::unordered_map<std::wstring, PGEnums::TextureType> manualTextureMapsMap;
+    for (const auto& [rulePath, ruleType] : manualTextureMaps) {
+        auto key = rulePath;
+        std::ranges::replace(key, L'/', L'\\');
+        StringUtil::toLowerASCIIFastInPlace(key);
+        manualTextureMapsMap.try_emplace(key, ruleType);
+    }
 
     Logger::info("Starting to build texture mappings");
 
@@ -175,29 +211,44 @@ void PGDirectory::mapFiles(const std::vector<std::wstring>& nifBlocklist,
     // Create runner.
     TaskPoolRunner runner(multithreading);
 
-    // Loop through each mesh to confirm textures.
+    // Loop through each mesh to confirm textures. The allowlist and blocklist are checked inside the task: matching
+    // every mesh against every glob is too slow to do up front on this thread.
     for (const auto& mesh : m_unconfirmedMeshes) {
-        if (!nifAllowlist.empty() && !checkGlobMatchInVector(mesh.wstring(), nifAllowlist)) {
-            // Skip mesh because it is not on allowlist.
-            Logger::debug(L"Skipping mesh due to allowlist: {}", mesh.wstring());
-            taskTracker.completeJob(TaskTracker::Result::Success);
-            continue;
-        }
+        runner.addTask([this, &taskTracker, &mesh, &multithreading, &nifAllowlist, &nifBlocklist] {
+            if (!nifAllowlist.empty() && !checkGlobMatchInVector(mesh.wstring(), nifAllowlist)) {
+                // Skip mesh because it is not on allowlist.
+                Logger::debug(L"Skipping mesh due to allowlist: {}", mesh.wstring());
+                taskTracker.completeJob(TaskTracker::Result::Success);
+                return;
+            }
 
-        if (!nifBlocklist.empty() && checkGlobMatchInVector(mesh.wstring(), nifBlocklist)) {
-            // Skip mesh because it is on blocklist.
-            Logger::debug(L"Skipping mesh due to blocklist: {}", mesh.wstring());
-            taskTracker.completeJob(TaskTracker::Result::Success);
-            continue;
-        }
+            if (!nifBlocklist.empty() && checkGlobMatchInVector(mesh.wstring(), nifBlocklist)) {
+                // Skip mesh because it is on blocklist.
+                Logger::debug(L"Skipping mesh due to blocklist: {}", mesh.wstring());
+                taskTracker.completeJob(TaskTracker::Result::Success);
+                return;
+            }
 
-        runner.addTask([this, &taskTracker, &mesh, &multithreading] {
             taskTracker.completeJob(mapTexturesFromNIF(mesh, multithreading));
         });
     }
 
     // Blocks until all tasks are done.
     runner.runTasks();
+
+    classifyUnconfirmedTextures(manualTextureMapsMap, parallaxBSAExcludes, multithreading);
+
+    // Cleanup.
+    m_unconfirmedTextures.clear();
+    m_unconfirmedMeshes.clear();
+}
+
+void PGDirectory::classifyUnconfirmedTextures(const std::unordered_map<std::wstring,
+                                                                       PGEnums::TextureType>& manualTextureMapsMap,
+                                              const std::vector<std::wstring>& parallaxBSAExcludes,
+                                              const bool& multithreading)
+{
+    size_t disabledCount = 0;
 
     // Loop through unconfirmed textures to confirm them.
     for (const auto& [texture, property] : m_unconfirmedTextures) {
@@ -236,6 +287,11 @@ void PGDirectory::mapFiles(const std::vector<std::wstring>& nifBlocklist,
             // Manual texture map found, override.
             winningType = manualTextureMapsMap.at(texture.wstring());
             winningSlot = PGNIFUtil::slotFromTexType(winningType);
+        } else if (isDisabledByJSON(texture, winningType)) {
+            // Left out like a texture that a manual texture map sets to unknown.
+            Logger::debug(L"Ignoring texture disabled by its JSON: {}", texture.wstring());
+            disabledCount++;
+            continue;
         }
 
         if (winningSlot == PGEnums::TextureSlots::Parallax && isFileInBSA(texture, parallaxBSAExcludes))
@@ -246,7 +302,8 @@ void PGDirectory::mapFiles(const std::vector<std::wstring>& nifBlocklist,
         if (winningType == PGEnums::TextureType::EnvironmentMask && !isFileInBSA(texture, parallaxBSAExcludes)) {
             // Reuse the classification of a previous run if the texture did not change.
             PGTypes::CMClassification cachedClassification;
-            if (PGRunCache::tryGetCachedCMClassification(texture, fileIdentity(texture), cachedClassification)) {
+            if (PGRunObserver::current().tryGetCachedCMClassification(
+                    texture, fileIdentity(texture), cachedClassification)) {
                 applyCMClassification(texture, winningSlot, cachedClassification);
                 continue;
             }
@@ -269,9 +326,40 @@ void PGDirectory::mapFiles(const std::vector<std::wstring>& nifBlocklist,
         }
     }
 
-    // Cleanup.
-    m_unconfirmedTextures.clear();
-    m_unconfirmedMeshes.clear();
+    // The textures themselves are listed at debug level.
+    if (disabledCount)
+        Logger::info("Ignored {} textures disabled by their JSON", disabledCount);
+}
+
+bool PGDirectory::isDisabledByJSON(const std::filesystem::path& texture,
+                                   const PGEnums::TextureType& type)
+{
+    // Height maps have parallax JSONs and environment masks have complex material JSONs. The textures of every other
+    // type, the height maps of the TruePBR shader among them, have none.
+    if (type != PGEnums::TextureType::Height && type != PGEnums::TextureType::EnvironmentMask)
+        return false;
+
+    auto jsonPath = texture;
+    jsonPath.replace_extension(".json");
+    if (!isFile(jsonPath))
+        return false;
+
+    std::vector<std::byte> jsonBytes;
+    try {
+        jsonBytes = file(jsonPath);
+    } catch (...) {
+        Logger::error(L"Unable to read JSON: {}", jsonPath.wstring());
+        return false;
+    }
+
+    nlohmann::json json;
+    if (!FileUtil::getJSONFromBytes(jsonBytes, json)) {
+        Logger::error(L"Failed to parse JSON: {}", jsonPath.wstring());
+        return false;
+    }
+
+    const auto disabled = json.find("disabled");
+    return disabled != json.end() && disabled->is_boolean() && disabled->get<bool>();
 }
 
 void PGDirectory::checkIfCMAddToMap(const std::filesystem::path& texture,
@@ -297,7 +385,7 @@ void PGDirectory::checkIfCMAddToMap(const std::filesystem::path& texture,
     }
 
     // Remember the result for incremental runs.
-    PGRunCache::storeCMClassification(texture, fileIdentity(texture), classification);
+    PGRunObserver::current().storeCMClassification(texture, fileIdentity(texture), classification);
 
     applyCMClassification(texture, winningSlot, classification);
 }
@@ -341,21 +429,21 @@ TaskTracker::Result PGDirectory::mapTexturesFromNIF(const std::filesystem::path&
     // Texture votes: reuse the votes of a previous run when the NIF did not change, otherwise read the NIF.
     const auto nifIdentity = fileIdentity(nifPath);
     std::vector<PGTypes::TextureVote> votes;
-    if (!PGRunCache::tryGetCachedMeshVotes(nifPath, nifIdentity, votes)) {
+    if (!PGRunObserver::current().tryGetCachedMeshVotes(nifPath, nifIdentity, votes)) {
         if (!readTextureVotesFromNIF(nifPath, votes)) {
             Logger::error(L"Unable to process mesh: {}", nifPath.wstring());
             return TaskTracker::Result::Failure;
         }
 
-        PGRunCache::storeMeshVotes(nifPath, nifIdentity, votes);
+        PGRunObserver::current().storeMeshVotes(nifPath, nifIdentity, votes);
     }
 
     for (const auto& vote : votes)
         updateUnconfirmedTexturesMap(vote.texture, vote.slot, vote.type);
 
     // Mesh uses: reuse the previous run's uses when no plugin changed, otherwise ask the plugin library.
-    PGRunCache::MeshUses cachedUses;
-    if (PGRunCache::tryGetCachedMeshUses(nifPath, cachedUses)) {
+    PGRunObserver::MeshUses cachedUses;
+    if (PGRunObserver::current().tryGetCachedMeshUses(nifPath, cachedUses)) {
         updateNifCache(nifPath, cachedUses);
     } else if (multithreading) {
         m_meshUseMappingQueue.queueTask([this, nifPath] {
@@ -589,15 +677,21 @@ void PGDirectory::updateUnconfirmedTexturesMap(const std::filesystem::path& path
                                                const PGEnums::TextureSlots& slot,
                                                const PGEnums::TextureType& type)
 {
-    // Use mutex to make this thread safe.
-    const std::scoped_lock lock(m_unconfirmedTexturesMutex);
+    // Check if texture is already in map. No texture is added or removed while votes are cast (findFiles() fills the
+    // map before the first vote), so the lookup itself needs no lock.
+    const auto it = m_unconfirmedTextures.find(path);
+    if (it == m_unconfirmedTextures.end())
+        return;
 
-    // Check if texture is already in map.
-    if (m_unconfirmedTextures.contains(path)) {
-        // Texture is present.
-        m_unconfirmedTextures[path].slots[slot]++;
-        m_unconfirmedTextures[path].types[type]++;
-    }
+    // Texture is present. A vote only touches the counters of its own texture, so a mutex chosen by texture makes this
+    // thread safe without making votes for different textures wait for each other.
+    auto& property = it->second;
+    const auto mutexIndex
+        = std::hash<const UnconfirmedTextureProperty*> { }(&property) % m_unconfirmedTextureMutexes.size();
+    const std::scoped_lock lock(m_unconfirmedTextureMutexes.at(mutexIndex));
+
+    property.slots[slot]++;
+    property.types[type]++;
 }
 
 void PGDirectory::addToTextureMaps(const std::filesystem::path& path,
@@ -629,20 +723,9 @@ void PGDirectory::addToTextureMaps(const std::filesystem::path& path,
         m_textureTypes[path] = details;
     }
 
-    // Add shader types to mod given certain types.
-    if (type == PGEnums::TextureType::Height) {
-        // Parallax.
-        if (PGGlobals::isPGMMSet())
-            PGGlobals::pgmm()->addShaderToModByFile(path, PGEnums::ShapeShader::VanillaParallax);
-    } else if (type == PGEnums::TextureType::ComplexMaterial) {
-        // PBR parallax.
-        if (PGGlobals::isPGMMSet())
-            PGGlobals::pgmm()->addShaderToModByFile(path, PGEnums::ShapeShader::ComplexMaterial);
-    } else {
-        // Default shader for all other types.
-        if (PGGlobals::isPGMMSet())
-            PGGlobals::pgmm()->addShaderToModByFile(path, PGEnums::ShapeShader::None);
-    }
+    // The texture's mod provides the shader of its type (attributeMods() replays this for another mod manager).
+    if (PGGlobals::isPGMMSet())
+        PGGlobals::pgmm()->addShaderToModByFile(path, shaderOfTextureType(type));
 }
 
 void PGDirectory::updateNifCache(const std::filesystem::path& path,
@@ -683,6 +766,33 @@ const std::unordered_set<std::filesystem::path>& PGDirectory::textures() const {
 
 const std::vector<std::filesystem::path>& PGDirectory::pbrJSONs() const { return m_pbrJSONs; }
 
+void PGDirectory::attributeMods(PGModManager& modManager)
+{
+    {
+        const std::shared_lock lock(m_textureTypesMutex);
+        for (const auto& [path, details] : m_textureTypes) {
+            // A generated texture has a type (setTextureType()) but was never mapped, so it gave its mod no shader.
+            if (isGenerated(path))
+                continue;
+
+            modManager.addShaderToModByFile(path, shaderOfTextureType(details.type));
+        }
+    }
+
+    for (const auto& json : m_pbrJSONs)
+        modManager.addShaderToModByFile(json, PGEnums::ShapeShader::TruePBR);
+
+    const std::shared_lock lock(m_meshesMutex);
+    for (const auto& [path, cache] : m_meshes) {
+        const auto mod = modManager.modByFileSmart(path);
+        if (!mod)
+            continue;
+
+        const std::unique_lock modLock(mod->mutex);
+        mod->hasMeshes = true;
+    }
+}
+
 const std::vector<std::filesystem::path>& PGDirectory::lightPlacerJSONs() const { return m_lightPlacerJSONs; }
 
 bool PGDirectory::addTextureAttribute(const std::filesystem::path& path,
@@ -718,7 +828,7 @@ bool PGDirectory::hasTextureAttribute(const std::filesystem::path& path,
     }
 
     // Record lookup for incremental runs (no-op unless a mesh is being recorded on this thread).
-    PGRunCache::recordTextureAttribute(path, attribute, result);
+    PGRunObserver::current().recordTextureAttribute(path, attribute, result);
 
     return result;
 }
@@ -733,7 +843,7 @@ std::unordered_set<PGEnums::TextureAttribute> PGDirectory::textureAttributes(con
     }
 
     // Record lookup for incremental runs (no-op unless a mesh is being recorded on this thread).
-    PGRunCache::recordTextureAttributes(path, result);
+    PGRunObserver::current().recordTextureAttributes(path, result);
 
     return result;
 }
@@ -755,7 +865,7 @@ PGEnums::TextureType PGDirectory::textureType(const std::filesystem::path& path)
     }
 
     // Record lookup for incremental runs (no-op unless a mesh is being recorded on this thread).
-    PGRunCache::recordTextureType(path, result);
+    PGRunObserver::current().recordTextureType(path, result);
 
     return result;
 }

@@ -2,8 +2,6 @@
 
 #include "util/ExceptionHandler.hpp"
 
-#include <cpptrace/from_current.hpp>
-
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -16,7 +14,8 @@
  * @brief Single-threaded task queue that executes submitted callables serially on a background thread.
  *
  * Tasks are processed in FIFO order. If a task throws an exception it is captured via
- * ExceptionHandler and an optional callback is invoked; no further tasks are processed after that.
+ * ExceptionHandler and an optional callback is invoked; no further tasks are processed after that. Tasks that
+ * will not be processed anymore are dropped, so waitForCompletion() does not wait for them.
  */
 class TaskQueue {
 private:
@@ -28,6 +27,7 @@ private:
     std::atomic<bool> m_running { true };
     std::atomic<bool> m_isBusy { false };
     std::atomic<size_t> m_queuedTasks { 0 };
+    std::atomic<size_t> m_unfinishedTasks { 0 }; /** Queued or running: a task leaves this count once it has run */
     std::thread m_workerThread;
 
     static std::function<void()> s_exceptionCallback;
@@ -53,7 +53,8 @@ public:
     /**
      * @brief Submits a callable to be executed on the background worker thread.
      *
-     * The task is silently dropped if ExceptionHandler::hasException() returns true.
+     * The task is silently dropped if ExceptionHandler::hasException() returns true or if the worker thread has
+     * already stopped.
      *
      * @tparam Func Callable type (any invocable that takes no arguments).
      * @param func The callable to enqueue.
@@ -67,8 +68,14 @@ public:
 
         {
             std::scoped_lock const lock(m_queueMutex);
+            if (!m_running) {
+                // The worker has stopped (shutdown, or an exception elsewhere), so the task would never run.
+                return;
+            }
+
             m_taskQueue.emplace(std::forward<Func>(func));
             m_queuedTasks++;
+            m_unfinishedTasks++;
         }
         m_cv.notify_one();
     }
@@ -95,9 +102,10 @@ public:
     bool isProcessing() const;
 
     /**
-     * @brief Returns whether the queue has been shut down.
+     * @brief Returns whether the worker thread stopped, either through shutdown() or because an exception was recorded
+     * in ExceptionHandler.
      *
-     * @return true if shutdown() has been called and the worker thread is no longer running.
+     * @return true if no further tasks will be processed.
      */
     bool isShutdown() const;
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PGModManager.hpp"
+#include "PGParams.hpp"
 #include "PGPlugin.hpp"
 #include "common/BethesdaGame.hpp"
 #include "pgutil/PGEnums.hpp"
@@ -20,135 +21,16 @@
 
 /**
  * @class PGConfig
- * @brief Class responsible for PGPatcherruntime configuration and JSON file interaction
+ * @brief Holds the PGPatcher runtime configuration and reads and writes the JSON files of the cfg folder next to the
+ * executable
  */
 class PGConfig {
 public:
-    /**
-     * @struct PGParams
-     * @brief Struct that holds all the user-configurable parameters for ParallaxGen
-     */
-    struct PGParams {
-        // Game.
-        struct Game {
-            std::filesystem::path dir;
-            BethesdaGame::GameType type = BethesdaGame::GameType::SkyrimSE;
-
-            bool operator==(const Game& other) const { return dir == other.dir && type == other.type; }
-        } game;
-
-        // Mod Manager.
-        struct ModManager {
-            PGModManager::ModManagerType type = PGModManager::ModManagerType::None;
-            std::filesystem::path mo2InstanceDir;
-            bool shouldUseMO2LooseFileOrder = true;
-
-            bool operator==(const ModManager& other) const
-            {
-                return type == other.type && mo2InstanceDir == other.mo2InstanceDir
-                    && shouldUseMO2LooseFileOrder == other.shouldUseMO2LooseFileOrder;
-            }
-        } modManager;
-
-        // Output.
-        struct Output {
-            std::filesystem::path dir;
-            bool zip = false;
-            PGPlugin::PluginLang pluginLang = PGPlugin::PluginLang::English;
-
-            bool operator==(const Output& other) const
-            {
-                return dir == other.dir && zip == other.zip && pluginLang == other.pluginLang;
-            }
-        } output;
-
-        // Processing.
-        struct Processing {
-            bool multithread = true;
-            bool enableModDevMode = false;
-            bool enableDebugLogging = false;
-            bool enableTraceLogging = false;
-            std::unordered_set<PGPlugin::ModelRecordType> allowedModelRecordTypes = PGPlugin::defaultRecTypeSet();
-            std::vector<std::wstring> vanillaBSAList;
-            std::vector<std::pair<std::wstring, PGEnums::TextureType>> textureMaps;
-            std::vector<std::wstring> allowList;
-            std::vector<std::wstring> blockList;
-
-            bool operator==(const Processing& other) const
-            {
-                return multithread == other.multithread && enableModDevMode == other.enableModDevMode
-                    && enableDebugLogging == other.enableDebugLogging && enableTraceLogging == other.enableTraceLogging
-                    && allowedModelRecordTypes == other.allowedModelRecordTypes
-                    && vanillaBSAList == other.vanillaBSAList && textureMaps == other.textureMaps
-                    && allowList == other.allowList && blockList == other.blockList;
-            }
-        } processing;
-
-        // Pre-Patchers.
-        struct PrePatcher {
-            bool isFixMeshLightingEnabled = false;
-
-            bool operator==(const PrePatcher& other) const
-            {
-                return isFixMeshLightingEnabled == other.isFixMeshLightingEnabled;
-            }
-        } prePatcher;
-
-        // Shader Patchers.
-        struct ShaderPatcher {
-            bool isParallaxEnabled = true;
-            bool isComplexMaterialEnabled = true;
-            bool isTruePBREnabled = false;
-
-            bool operator==(const ShaderPatcher& other) const
-            {
-                return isParallaxEnabled == other.isParallaxEnabled
-                    && isComplexMaterialEnabled == other.isComplexMaterialEnabled
-                    && isTruePBREnabled == other.isTruePBREnabled;
-            }
-        } shaderPatcher;
-
-        // Shader Transforms.
-        struct ShaderTransforms {
-            bool isParallaxToCMEnabled = false;
-
-            bool operator==(const ShaderTransforms& other) const
-            {
-                return isParallaxToCMEnabled == other.isParallaxToCMEnabled;
-            }
-        } shaderTransforms;
-
-        // Post-Patchers.
-        struct PostPatcher {
-            bool disablePrePatchedMaterials = true;
-            bool isFixSSSEnabled = false;
-            bool isHairFlowMapEnabled = false;
-
-            bool operator==(const PostPatcher& other) const
-            {
-                return disablePrePatchedMaterials == other.disablePrePatchedMaterials
-                    && isFixSSSEnabled == other.isFixSSSEnabled && isHairFlowMapEnabled == other.isHairFlowMapEnabled;
-            }
-        } postPatcher;
-
-        // Global Patchers.
-        struct GlobalPatcher {
-            bool operator==([[maybe_unused]] const GlobalPatcher& other) const { return true; }
-        } globalPatcher;
-
-        bool operator==(const PGParams& other) const
-        {
-            return game == other.game && modManager == other.modManager && output == other.output
-                && processing == other.processing && prePatcher == other.prePatcher
-                && shaderPatcher == other.shaderPatcher && shaderTransforms == other.shaderTransforms
-                && postPatcher == other.postPatcher && globalPatcher == other.globalPatcher;
-        }
-
-        bool operator!=(const PGParams& other) const { return !(*this == other); }
-    };
+    /// @brief The patching parameters, see PGParams (shared with the runtime).
+    using PGParams = ::PGParams;
 
 private:
-    static std::filesystem::path s_exePath; /** Stores the ExePath of ParallaxGen.exe */
+    static std::filesystem::path s_exePath; /** Folder containing PGPatcher.exe */
 
     PGParams m_params; /** Stores the configured parameters */
 
@@ -162,28 +44,31 @@ public:
     /**
      * @brief Loads required statics for the class
      *
-     * @param exePath Path to ParallaxGen.exe (folder)
+     * @param exePath Folder containing PGPatcher.exe; the cfg folder is resolved against it
      */
     static void loadStatics(const std::filesystem::path& exePath);
 
     /**
      * @brief Get the User Config File object
      *
-     * @return std::filesystem::path Path to user config file
+     * @return std::filesystem::path Path to user config file (cfg\settings.json)
+     * @throws std::runtime_error if loadStatics() was not called
      */
     [[nodiscard]] static std::filesystem::path userConfigFile();
 
     /**
      * @brief Get the Mod Config File object
      *
-     * @return std::filesystem::path Path to mod config file
+     * @return std::filesystem::path Path to mod config file (cfg\modrules.json)
+     * @throws std::runtime_error if loadStatics() was not called
      */
     [[nodiscard]] static std::filesystem::path modConfigFile();
 
     /**
      * @brief Get the Ignored Messages Config File object
      *
-     * @return std::filesystem::path Path to ignored messages config file
+     * @return std::filesystem::path Path to ignored messages config file (cfg\ignored_messages.json)
+     * @throws std::runtime_error if loadStatics() was not called
      */
     [[nodiscard]] static std::filesystem::path ignoredMessagesConfigFile();
 
@@ -212,7 +97,8 @@ public:
     static void resolveRelativePaths(PGParams& params);
 
     /**
-     * @brief Loads the config files in the `cfg` folder
+     * @brief Loads the user config (settings.json). The params fall back to defaultParams() when the file is missing
+     * or cannot be parsed
      */
     void loadConfig();
 
@@ -224,7 +110,7 @@ public:
     [[nodiscard]] PGParams params() const;
 
     /**
-     * @brief Set params (also saves to user json)
+     * @brief Set params in memory only (persisted on the next saveUserConfig)
      *
      * @param params new params to set
      */
@@ -278,22 +164,36 @@ public:
     [[nodiscard]] nlohmann::json userConfigJSON() const;
 
     /**
-     * @brief Saves user config to the user json file
+     * @brief Saves user config (userConfigJSON()) to the user json file
      *
-     * @return true if save was successful
+     * @return true if save was successful (a failure is logged as critical)
      */
     bool saveUserConfig();
 
     /**
-     * @brief Saves the current mod configuration to modrules.json
+     * @brief Saves the current mod configuration (PGGlobals::pgmm()->json()) to modrules.json
      *
-     * @return true if save was successful
+     * @return true if save was successful (a failure is logged as critical)
+     * @throws std::runtime_error if no mod manager is set
      */
     static bool saveModConfig();
 
+    /**
+     * @brief Reads the ignored warning messages from ignored_messages.json
+     *
+     * @return Message text to ignored flag; empty when the file does not exist
+     * @throws std::runtime_error if the file cannot be parsed or has the wrong format
+     */
     static std::unordered_map<wxString,
                               bool>
     ignoredMessagesConfig();
+
+    /**
+     * @brief Writes the ignored warning messages to ignored_messages.json
+     *
+     * @param ignoredItems Message text to ignored flag
+     * @return true if save was successful (a failure is logged as critical)
+     */
     static bool saveIgnoredMessagesConfig(const std::unordered_map<wxString,
                                                                    bool>& ignoredItems);
 
@@ -315,11 +215,4 @@ private:
      * @param j JSON object to add
      */
     void addConfigJSON(const nlohmann::json& j);
-
-    /**
-     * @brief Replaces any / with \\ in a JSON object
-     *
-     * @param j JSON object to change
-     */
-    static void replaceForwardSlashes(nlohmann::json& j);
 };

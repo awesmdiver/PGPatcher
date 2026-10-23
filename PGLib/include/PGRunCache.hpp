@@ -3,6 +3,7 @@
 #include "PGDirectory.hpp"
 #include "PGPatcher.hpp"
 #include "PGPlugin.hpp"
+#include "PGRunObserver.hpp"
 #include "common/BethesdaDirectory.hpp"
 #include "pgutil/PGEnums.hpp"
 #include "pgutil/PGMeshPermutationTracker.hpp"
@@ -49,8 +50,8 @@ class PGRunCache {
 public:
     static inline const std::filesystem::path s_cacheFilename = L"PGPatcher_UpdateCache.bin";
 
-    /// @brief Texture hook patchers whose generated outputs are tracked by the cache
-    enum class HookKind : uint8_t { ConvertToCM, FixSSS };
+    /// @brief Texture hook patchers whose generated outputs are tracked by the cache, see PGRunObserver::HookKind
+    using HookKind = PGRunObserver::HookKind;
 
     /// @brief Result of a file existence query as seen by a patcher
     enum class FileExistsState : uint8_t { Missing, Exists, Generated };
@@ -217,7 +218,7 @@ public:
                                const PGEnums::TextureType& type);
         void recordTextureAttribute(const std::filesystem::path& path,
                                     const PGEnums::TextureAttribute& attribute,
-                                    bool value);
+                                    bool hasAttribute);
         void recordTextureAttributes(const std::filesystem::path& path,
                                      const std::unordered_set<PGEnums::TextureAttribute>& attributes);
         void recordTexMatch(const std::wstring& base,
@@ -252,24 +253,64 @@ public:
     };
 
     /**
-     * @brief RAII guard that suspends dependency recording on the current thread while alive.
-     *
-     * Used around computations whose result is recorded as a whole (the match digest) and around reads whose content
-     * does not influence mesh output (DDS pixel data).
+     * @brief The PGRunObserver that forwards to this cache, see installObserver().
      */
-    class SuspendRecording {
+    class Observer final : public PGRunObserver {
     public:
-        SuspendRecording();
-        ~SuspendRecording();
-        SuspendRecording(const SuspendRecording&) = delete;
-        SuspendRecording& operator=(const SuspendRecording&) = delete;
-        SuspendRecording(SuspendRecording&&) = delete;
-        SuspendRecording& operator=(SuspendRecording&&) = delete;
+        void recordTextureType(const std::filesystem::path& path,
+                               const PGEnums::TextureType& type) override;
+        void recordTextureAttribute(const std::filesystem::path& path,
+                                    const PGEnums::TextureAttribute& attribute,
+                                    bool hasAttribute) override;
+        void recordTextureAttributes(const std::filesystem::path& path,
+                                     const std::unordered_set<PGEnums::TextureAttribute>& attributes) override;
+        void recordTexMatch(const std::wstring& base,
+                            const PGEnums::TextureType& type,
+                            const std::vector<PGTypes::PGTexture>& results) override;
+        void recordModOfFile(const std::filesystem::path& path,
+                             const std::wstring& modName) override;
+        void recordMatches(const PGTypes::TextureSet& slots,
+                           bool isSinglepassMATO,
+                           const PGPlugin::ModelRecordType& recType,
+                           uint64_t digest) override;
+        void recordOutputFile(const std::filesystem::path& relPath,
+                              uint64_t size) override;
+        void recordHookRegistration(const HookKind& kind,
+                                    const std::filesystem::path& texPath) override;
+        bool tryReuseHookOutput(const HookKind& kind,
+                                const std::filesystem::path& texPath) override;
+        void recordHookOutput(const HookKind& kind,
+                              const std::filesystem::path& source,
+                              const std::filesystem::path& output) override;
+        void suspendRecording() override;
+        void resumeRecording() override;
+        bool tryGetCachedMeshVotes(const std::filesystem::path& nifPath,
+                                   const BethesdaDirectory::FileIdentity& identity,
+                                   std::vector<PGTypes::TextureVote>& votes) override;
+        void storeMeshVotes(const std::filesystem::path& nifPath,
+                            const BethesdaDirectory::FileIdentity& identity,
+                            const std::vector<PGTypes::TextureVote>& votes) override;
+        bool tryGetCachedMeshUses(const std::filesystem::path& nifPath,
+                                  MeshUses& uses) override;
+        bool tryGetCachedCMClassification(const std::filesystem::path& texture,
+                                          const BethesdaDirectory::FileIdentity& identity,
+                                          PGTypes::CMClassification& result) override;
+        void storeCMClassification(const std::filesystem::path& texture,
+                                   const BethesdaDirectory::FileIdentity& identity,
+                                   const PGTypes::CMClassification& result) override;
     };
 
+    /**
+     * @brief Installs the cache as the PGRunObserver of the process, so the shared code reports its lookups and reads
+     * the cached classifications. Done by initialize() and by every MeshRecorder.
+     */
+    static void installObserver();
+
 private:
+    static inline Observer s_observer;
+
     static constexpr uint32_t formatMagic = 0x43524750; // "PGRC"
-    static constexpr uint32_t formatVersion = 2;
+    static constexpr uint32_t formatVersion = 3;
 
     static inline bool s_enabled = false;
     static inline std::filesystem::path s_cacheFile;
@@ -331,9 +372,6 @@ private:
     static std::unordered_map<std::wstring,
                               OutputIdentity>
     collectOutputIdentities();
-
-    static std::filesystem::path hookOutputPath(const HookKind& kind,
-                                                const std::filesystem::path& texPath);
 
     static bool evaluateMesh(const std::filesystem::path& nifPath,
                              const PGDirectory::NifCache& nifCache,
@@ -442,31 +480,56 @@ public:
     // Classification caches (used by PGDirectory::mapFiles)
     //
 
+    /**
+     * @brief Returns the texture votes of a mesh from the previous run if the mesh has the same identity, and keeps
+     * them for this run.
+     */
     static bool tryGetCachedMeshVotes(const std::filesystem::path& nifPath,
                                       const BethesdaDirectory::FileIdentity& identity,
                                       std::vector<TextureVote>& votes);
+
+    /**
+     * @brief Keeps the texture votes of a mesh read in this run. Generated and missing files are not stored.
+     */
     static void storeMeshVotes(const std::filesystem::path& nifPath,
                                const BethesdaDirectory::FileIdentity& identity,
                                const std::vector<TextureVote>& votes);
+
+    /**
+     * @brief Returns the plugin uses of a mesh from the previous run if arePreviousMeshUsesValid().
+     */
     static bool tryGetCachedMeshUses(const std::filesystem::path& nifPath,
                                      MeshUses& uses);
+
+    /**
+     * @brief Returns the complex material classification of a texture from the previous run if the texture has the
+     * same identity, and keeps it for this run.
+     */
     static bool tryGetCachedCMClassification(const std::filesystem::path& texture,
                                              const BethesdaDirectory::FileIdentity& identity,
                                              CMClassification& result);
+
+    /**
+     * @brief Keeps the complex material classification of a texture made in this run.
+     */
     static void storeCMClassification(const std::filesystem::path& texture,
                                       const BethesdaDirectory::FileIdentity& identity,
                                       const CMClassification& result);
 
     //
-    // Recording (no-ops unless a MeshRecorder is active on the calling thread).
+    // Recording (no-ops unless a MeshRecorder is active on the calling thread). Each records the result of the
+    // corresponding query as a dependency of the mesh being patched.
     //
 
+    /**
+     * @brief Whether a MeshRecorder is active on this thread and recording is not suspended.
+     */
     static bool isRecording();
     static void recordTextureType(const std::filesystem::path& path,
                                   const PGEnums::TextureType& type);
     static void recordTextureAttribute(const std::filesystem::path& path,
                                        const PGEnums::TextureAttribute& attribute,
-                                       bool value);
+                                       bool hasAttribute);
     static void recordTextureAttributes(const std::filesystem::path& path,
                                         const std::unordered_set<PGEnums::TextureAttribute>& attributes);
     static void recordTexMatch(const std::wstring& base,

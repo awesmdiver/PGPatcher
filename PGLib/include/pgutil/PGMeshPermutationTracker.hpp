@@ -8,10 +8,12 @@
 #include "Shaders.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,10 +21,16 @@
 #include <vector>
 
 /**
- * @brief Class responsible for tracking all output mesh permutations from a given input mesh
+ * @brief Collects the output meshes of one input mesh.
+ *
+ * Every plugin use of a mesh is patched on its own staged copy. commitMesh() keeps only the distinct results: a result
+ * equal to an earlier output is merged into it, a result equal to the original mesh means the use keeps the unpatched
+ * file. saveMeshes() writes the base mesh and its duplicates (under _pgpatcher_dups) and reports, per output, which
+ * plugin uses it serves. Weighted (_0/_1) armor meshes are additionally checked to produce matching outputs.
  */
 class PGMeshPermutationTracker {
 public:
+    /// @brief Identifies one plugin use of a mesh: a model of a record.
     struct FormKey {
         /// @brief Name of the mod file (plugin) that owns this form (e.g., L"Skyrim.esm").
         std::wstring modKey;
@@ -65,15 +73,36 @@ public:
         }
     };
 
+    /// @brief One saved output mesh and the plugin uses it serves.
     struct MeshResult {
         /// @brief Relative path (within the data directory) of the saved output mesh file.
         std::filesystem::path meshPath;
-        /// @brief Alternate texture results keyed by FormKey; each maps shape index to a TextureSet.
+        /// @brief Alternate texture results keyed by FormKey; each maps the original 3D index of a shape to its
+        /// patched TextureSet.
         std::vector<std::pair<FormKey, std::unordered_map<unsigned, PGTypes::TextureSet>>> altTexResults;
-        /// @brief Index corrections mapping old 3D block indices to new indices after sorting.
+        /// @brief Original 3D index of each shape mapped to its 3D index in the saved file (-1 if it was deleted).
         std::unordered_map<int, int> idxCorrections;
-        /// @brief Index corrections mapping old 3D block indices to new indices after patching.
+        /// @brief 3D index of each shape after patching mapped back to its original 3D index, so shapes deleted by
+        /// patchers do not shift the indices alternate textures refer to.
         std::unordered_map<int, int> inverseIdxCorrectionsPatching;
+        /// @brief Bounding box of the saved mesh in model space, computed across the shapes below the root that store
+        /// vertex positions. Empty if the mesh has none, or if bounds were not requested when saving.
+        std::optional<PGTypes::ObjectBounds> objectBounds;
+    };
+
+    /// @brief What the weighted (_0/_1) layout check tells the blocks of a mesh apart by, see blockTypeSignature().
+    enum class BlockKind : uint8_t { ParticleSystem, TriShape, Shape };
+
+    /// @brief One output mesh serialized in memory, see serializeMeshes().
+    struct SerializedOutput {
+        /// @brief The output and the plugin uses it serves, with its index corrections filled in.
+        MeshResult result;
+        /// @brief The bytes of the saved mesh.
+        std::string bytes;
+        /// @brief The block type signature of the mesh, see blockTypeSignature().
+        std::vector<BlockKind> blockKinds;
+        /// @brief CRC32 of the bytes.
+        unsigned long long crc32 = 0;
     };
 
 private:
@@ -118,13 +147,26 @@ public:
      * @brief Constructs a tracker for the given original mesh path.
      *
      * @param origMeshPath Relative path (within the data directory) to the source NIF file.
-     * @throws std::runtime_error if the file does not exist in the directory.
+     * @throws std::runtime_error if the file is not in the file map of PGGlobals::pgd().
      */
     explicit PGMeshPermutationTracker(const std::filesystem::path& origMeshPath);
 
+    /**
+     * @brief Constructs a tracker for a mesh given as bytes, and loads it (do not call load()). Needs no file map; the
+     * PGLite runtime uses it with the bytes the game would read.
+     *
+     * @param origMeshPath Relative path (within the data directory) of the mesh the bytes belong to.
+     * @param nifBytes The mesh file.
+     * @throws std::runtime_error if the bytes are not a NIF.
+     */
+    PGMeshPermutationTracker(std::filesystem::path origMeshPath,
+                             const std::vector<std::byte>& nifBytes);
+
     // Plugin mesh staging.
     /**
-     * @brief Loads the original NIF file and computes its CRC32 from the game directory.
+     * @brief Reads the original NIF through PGGlobals::pgd(), computes the CRC32 of its bytes and loads it.
+     *
+     * @throws std::runtime_error if the NIF cannot be read or loaded.
      */
     void load();
 
@@ -150,36 +192,90 @@ public:
      */
     void ignoreBaseMesh();
 
-    /**
-     * @brief Commits the current staged mesh as a new output permutation for the given form key.
-     *
-     * Compares the staged mesh against all existing output meshes (and the original) to avoid
-     * duplicates. If an identical mesh already exists, the form key is appended to it instead.
-     *
-     * @param formKey The plugin form key that references this mesh permutation.
-     * @param isWeighted Whether the mesh uses a weighted (body) variant requiring _1/_0 counterpart handling.
-     * @param altTexResults Map from shape index to TextureSet for alternate texture overrides.
-     * @param nonAltTexShapes Set of shape indices whose texture sets must match exactly.
-     * @return true if a new unique output mesh was added; false if deduplicated or already processed.
-     */
-    bool commitMesh(const FormKey& formKey,
-                    bool isWeighted,
-                    const std::unordered_map<unsigned,
-                                             PGTypes::TextureSet>& altTexResults,
-                    const std::unordered_set<unsigned>& nonAltTexShapes);
+    /// @brief What became of a staged mesh in commitMesh().
+    enum class CommitResult : uint8_t {
+        Added, ///< The staged mesh is a new output mesh.
+        MergedIntoOutput, ///< The staged mesh equals an existing output mesh, which now serves this form key too.
+        UnchangedFromOriginal, ///< The staged mesh equals the original mesh, which stays in use unpatched.
+        AlreadyProcessed, ///< The form key was committed before.
+    };
 
     /**
-     * @brief Saves all committed output meshes to disk and returns their results with CRC statistics.
+     * @brief Commits the current staged mesh as the output of the given form key and clears the staging area.
      *
-     * @return Pair of (list of MeshResult, pair of (base CRC32, total bytes written)).
+     * The staged mesh is compared with every existing output mesh and, when there is none yet, with the original
+     * mesh. Texture sets of shapes without an alternate texture take part in the comparison; the others are supplied
+     * by the plugin and so do not have to match.
+     *
+     * @param formKey The plugin use that was patched.
+     * @param isWeighted Whether the use is a weighted armor model, whose _0/_1 counterpart has to produce the same
+     * output (see validateWeightedVariants()).
+     * @param altTexResults Patched alternate textures of the use by original 3D shape index.
+     * @param nonAltTexShapes Original 3D indices of the shapes that had no alternate texture.
+     * @param shouldCompareWithOriginal Whether a first result that equals the original mesh is dropped
+     * (CommitResult::UnchangedFromOriginal) instead of becoming an output. The PGLite runtime passes false when it
+     * produces again a member whose first patch became an output, so that the same bytes are served.
+     * @return What became of the staged mesh. Only CommitResult::Added means a new output mesh was created.
+     * @throws std::runtime_error if no mesh is staged.
+     */
+    CommitResult commitMesh(const FormKey& formKey,
+                            bool isWeighted,
+                            const std::unordered_map<unsigned,
+                                                     PGTypes::TextureSet>& altTexResults,
+                            const std::unordered_set<unsigned>& nonAltTexShapes,
+                            bool shouldCompareWithOriginal = true);
+
+    /**
+     * @brief Sorts the blocks of every output mesh, queues the files for writing through PGGlobals::fileSaver() and
+     * registers them as generated files.
+     *
+     * The first output takes the original path unless ignoreBaseMesh() was called, the others go under
+     * _pgpatcher_dups. Each result carries the shape index corrections the plugin needs.
+     *
+     * @param shouldUpdateBounds whether to recompute the bounding sphere of every shape of each saved mesh
+     * @param shouldComputeObjectBounds whether to compute the bounding box of each saved mesh
+     * (MeshResult::objectBounds)
+     * @return The results, and a pair of the original mesh's CRC32 and the CRC32 of the saved base mesh (0 when the
+     * base mesh was not written). An empty result list with an all-zero pair means a mesh could not be serialized.
+     * @throws std::runtime_error if an output file already exists or the shape bookkeeping is inconsistent.
      */
     std::pair<std::vector<MeshResult>,
               std::pair<unsigned long long,
                         unsigned long long>>
-    saveMeshes();
+    saveMeshes(const bool& shouldUpdateBounds = false,
+               const bool& shouldComputeObjectBounds = false);
 
     /**
-     * @brief Validates all weighted mesh variants across all trackers, ensuring _0/_1 pairs are consistent.
+     * @brief Computes the bounding box of the original (unpatched) mesh. Patchers never move vertices, so this matches
+     * the bounding box of an output mesh unless a patcher deleted a shape (e.g. the TruePBR delete attribute). It does
+     * not require an output mesh to be produced.
+     *
+     * @return The bounding box, or std::nullopt if the mesh has no shapes with vertices.
+     */
+    std::optional<PGTypes::ObjectBounds> originalObjectBounds();
+
+    /**
+     * @brief Sorts the blocks of every output mesh and serializes it in memory: the same outputs, index corrections and
+     * bytes saveMeshes() writes, without touching the output directory. Call once per tracker.
+     *
+     * @param shouldUpdateBounds whether to recompute the bounding sphere of every shape of each output mesh
+     * @param shouldComputeObjectBounds whether to compute the bounding box of each output mesh
+     * (MeshResult::objectBounds)
+     * @return One entry per output mesh, in output order. Empty when a mesh could not be serialized (logged as
+     * critical).
+     */
+    std::vector<SerializedOutput> serializeMeshes(const bool& shouldUpdateBounds = false,
+                                                  const bool& shouldComputeObjectBounds = false);
+
+    /**
+     * @brief The block kinds of the shapes and particle systems of a mesh in 3D index order: what the weighted (_0/_1)
+     * layout check compares, so two meshes pass that check exactly when their signatures are equal.
+     */
+    static std::vector<BlockKind> blockTypeSignature(const nifly::NifFile& mesh);
+
+    /**
+     * @brief Reports every weighted mesh whose _0/_1 counterpart was also patched as weighted but produced a different
+     * result, then clears the state shared between trackers. Call once per run after all meshes were committed.
      *
      * @return Errors that were logged, as (mesh path the error is about, message) pairs.
      */
@@ -213,7 +309,8 @@ public:
 
 private:
     /**
-     * @brief Handles weighted variant logic for an output mesh (locates and validates the _0/_1 counterpart).
+     * @brief Pairs an output mesh with the same output of its _0/_1 counterpart: the first of the two is kept in a
+     * cache shared between trackers, the second compares itself against it and logs an error if they differ.
      *
      * @param mesh The output mesh serving the weighted plugin use.
      * @param dupIdx Index of the output mesh within this tracker.
@@ -221,15 +318,20 @@ private:
     void processWeightVariant(const nifly::NifFile& mesh,
                               std::size_t dupIdx);
 
+public:
     // Helpers.
     /**
-     * @brief Compares two NIF files for equivalence, optionally restricting to specific shape texture sets.
+     * @brief Compares the shapes and particle systems of two NIFs in 3D index order: block types, vertex colors,
+     * lighting and effect shader fields and, where requested, texture sets.
      *
      * @param meshA First NIF file.
      * @param meshB Second NIF file.
-     * @param enforceCheckShapeTXSTA Shape indices whose texture sets must be compared.
+     * @param enforceCheckShapeTXSTA Original 3D indices of the shapes of meshA whose texture sets must be compared.
      * @param compareAllTXST If true, compare all texture sets regardless of enforceCheckShapeTXSTA.
-     * @param checkOnlyWeighted If true, only compare weighted shapes.
+     * @param checkOnlyWeighted If true, only compare the block types (used for _0/_1 counterparts, whose geometry
+     * legitimately differs).
+     * @param meshAInverseIdxCorrectionsPatching Maps the current 3D indices of meshA to the original ones, so
+     * enforceCheckShapeTXSTA still applies after patchers deleted shapes. Optional.
      * @return true if the meshes are considered equivalent.
      */
     static bool compareMesh(const nifly::NifFile& meshA,
@@ -240,28 +342,29 @@ private:
                             const std::unordered_map<int,
                                                      int>* meshAInverseIdxCorrectionsPatching = nullptr);
 
+private:
     /**
-     * @brief Compares two BSTriShape blocks for geometric equivalence.
+     * @brief Compares the vertex colors of two BSTriShape blocks (the only geometry patchers change).
      *
      * @param shapeA First shape.
      * @param shapeB Second shape.
-     * @return true if the shapes are equivalent.
+     * @return true if both have no vertex colors, or both have the same vertex colors.
      */
     static bool compareBSTriShape(const nifly::BSTriShape& shapeA,
                                   const nifly::BSTriShape& shapeB);
 
     /**
-     * @brief Compares two NiShape blocks (name and type).
+     * @brief Compares whether two NiShape blocks both have vertex colors.
      *
      * @param shapeA First shape.
      * @param shapeB Second shape.
-     * @return true if the shapes are equivalent.
+     * @return true if the vertex color flags are equal.
      */
     static bool compareNiShape(const nifly::NiShape& shapeA,
                                const nifly::NiShape& shapeB);
 
     /**
-     * @brief Compares two BSLightingShaderProperty blocks for equivalence.
+     * @brief Compares two BSLightingShaderProperty blocks for equivalence (every field of the SSE mesh format).
      *
      * @param shaderA First shader property.
      * @param shaderB Second shader property.
@@ -271,7 +374,7 @@ private:
                                                 const nifly::BSLightingShaderProperty& shaderB);
 
     /**
-     * @brief Compares two BSEffectShaderProperty blocks for equivalence.
+     * @brief Compares the texture clamp mode of two BSEffectShaderProperty blocks (the only field patchers change).
      *
      * @param shaderA First shader property.
      * @param shaderB Second shader property.
@@ -291,45 +394,72 @@ private:
                                         const nifly::BSShaderProperty& shaderB);
 
     /**
-     * @brief Compares two BSShaderTextureSet blocks for texture path equivalence.
+     * @brief Compares two BSShaderTextureSet blocks slot by slot without regard to case (see
+     * PGMaterialState::isTextureSetEqual()).
      *
      * @param texSetA First texture set.
      * @param texSetB Second texture set.
-     * @return true if all texture slots are identical.
+     * @return true if all texture slots are equal.
      */
     static bool compareBSShaderTextureSet(nifly::BSShaderTextureSet& texSetA,
                                           nifly::BSShaderTextureSet& texSetB);
 
     /**
-     * @brief Computes the output file path for a mesh permutation.
+     * @brief Computes the output path of a mesh permutation.
      *
      * @param nifPath Original relative NIF path.
-     * @param index Permutation index (0 = base name, >0 appends index suffix).
+     * @param index Permutation index. 0 is the original path, every other index inserts "_pgpatcher_dups\<index>"
+     * after the first path component (e.g. meshes\_pgpatcher_dups\1\...).
      * @return Output relative path for the permutation.
      */
     static std::filesystem::path meshPath(const std::filesystem::path& nifPath,
                                           const size_t& index);
 
     /**
-     * @brief Returns all NiObject blocks from a NIF that are relevant for comparison.
+     * @brief Computes the bounding box of a NIF in model space, across every shape below the root that stores vertex
+     * positions (not only the ones PG can patch), accounting for the transforms from the root down. Positions that are
+     * not finite numbers are skipped. Truncated toward zero like the OBND subrecord the Creation Kit stores for
+     * statics, trees and grass.
+     *
+     * @param nif The NIF file to measure.
+     * @return The bounding box, or std::nullopt if the NIF has no such shape.
+     */
+    static std::optional<PGTypes::ObjectBounds> computeObjectBounds(nifly::NifFile& nif);
+
+    /**
+     * @brief Returns the shapes and particle systems of a NIF in 3D index order.
      *
      * @param nif Pointer to the NIF file.
-     * @return Vector of pointers to comparable NiObject blocks.
+     * @return The blocks, sorted by 3D index.
+     * @throws std::runtime_error if nif is null.
      */
     static std::vector<nifly::NiObject*> comparableBlocks(const nifly::NifFile* nif);
 
     /**
-     * @brief Builds a map from each 3D shape NiObject to its block index within the NIF.
+     * @brief Maps every shape and particle system of a NIF to its 3D index, the index plugins use for alternate
+     * textures (shapes and particle systems counted in block tree order).
      *
      * @param nif Pointer to the NIF file.
-     * @return Map from NiObject pointer to integer 3D index.
+     * @return Map from block to 3D index.
+     * @throws std::runtime_error if nif is null.
      */
     static std::unordered_map<nifly::NiObject*,
                               int>
     get3dIndices(const nifly::NifFile* nif);
 
+    /**
+     * @brief Returns the 3D indices of every shape and particle system of a NIF (see get3dIndices()).
+     *
+     * @throws std::runtime_error if nif is null.
+     */
     static std::unordered_set<int> get3dIndicesSet(const nifly::NifFile* nif);
 
+    /**
+     * @brief Maps the current 3D index of every block that still exists to its original 3D index.
+     *
+     * @param current3DIndices 3D indices after patching, see get3dIndices().
+     * @param original3DIndices 3D indices before patching.
+     */
     static std::unordered_map<int,
                               int>
     buildInverseIdxCorrections(const std::unordered_map<nifly::NiObject*,

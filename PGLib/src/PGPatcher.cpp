@@ -16,9 +16,10 @@
 #include "patchers/PatcherMeshShaderTransformParallaxToCM.hpp"
 #include "patchers/PatcherMeshShaderTruePBR.hpp"
 #include "patchers/PatcherMeshShaderVanillaParallax.hpp"
+
+#include "patchers/PatcherMeshPreStockMarker.hpp"
 #include "patchers/PatcherTextureHookConvertToCM.hpp"
 #include "patchers/PatcherTextureHookFixSSS.hpp"
-#include "patchers/base/PatcherMesh.hpp"
 #include "patchers/base/PatcherMeshShader.hpp"
 #include "patchers/base/PatcherUtil.hpp"
 #include "pgutil/PGEnums.hpp"
@@ -40,11 +41,9 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/asio.hpp>
 #include <boost/crc.hpp>
 #include <boost/iostreams/device/array.hpp>
 #include <boost/iostreams/stream.hpp>
-#include <boost/thread.hpp>
 #include <nlohmann/json_fwd.hpp>
 #include <spdlog/common.h>
 #include <spdlog/spdlog.h>
@@ -72,15 +71,16 @@
 #include <winnt.h>
 
 // Statics.
-PatcherUtil::PatcherMeshSet PGPatcher::s_meshPatchers;
-PatcherUtil::PatcherTextureSet PGPatcher::s_texPatchers;
-
 std::shared_mutex PGPatcher::s_diffJSONMutex;
 nlohmann::json PGPatcher::s_diffJSON;
 
 auto PGPatcher::buildStandardMeshPatcherSet(const ActivePatcherRequest& req) -> PatcherUtil::PatcherMeshSet
 {
     PatcherUtil::PatcherMeshSet meshPatchers;
+
+    // The stock marker reverts pre-patched shapes to stock, so it has to run before every other patcher. It is
+    // unconditional, as in upstream's GUI and pgtools; callers load its options (PGLite mode) themselves.
+    meshPatchers.prePatchers.emplace_back(PatcherMeshPreStockMarker::factory());
 
     if (req.fixMeshLighting) {
         meshPatchers.prePatchers.emplace_back(PatcherMeshPreFixMeshLighting::factory());
@@ -130,25 +130,37 @@ auto PGPatcher::buildStandardMeshPatcherSet(const ActivePatcherRequest& req) -> 
     return meshPatchers;
 }
 
-void PGPatcher::loadPatchers(const PatcherUtil::PatcherMeshSet& meshPatchers,
-                             const PatcherUtil::PatcherTextureSet& texPatchers)
-{
-    s_meshPatchers = meshPatchers;
-    s_texPatchers = texPatchers;
-}
-
 void PGPatcher::patchMeshes(const bool& shouldMultithread,
                             const bool& forceBasePatch,
                             const std::unordered_set<PGPlugin::ModelRecordType>& allowedModelRecTypes,
                             const bool& checkAllowedRecTypes,
                             const bool& excludeFacegens,
+                            const bool& isPGLiteMode,
                             const std::function<void(size_t,
                                                      size_t)>& progressCallback,
+                            const std::function<void(MeshPatchStage)>& stageCallback,
+                            const bool& shouldRecalculateBounds,
                             const bool& dryRun)
 {
     auto* const pgd = PGGlobals::pgd();
     pgd->waitForMeshMapping();
     pgd->waitForCMClassification();
+
+    // PGLite mode patches the uses of the record types DynDOLOD scans, within the allowed ones, and nothing that has
+    // no plugin use (the BodySlide ShapeData meshes aside, which patchNIF() keeps).
+    std::unordered_set<PGPlugin::ModelRecordType> recTypes = allowedModelRecTypes;
+    bool shouldCheckRecTypes = checkAllowedRecTypes;
+    bool shouldForceBasePatch = forceBasePatch;
+    if (isPGLiteMode) {
+        recTypes = PGPlugin::dynDOLODRecTypeSet();
+        if (checkAllowedRecTypes) {
+            std::erase_if(recTypes, [&allowedModelRecTypes](const PGPlugin::ModelRecordType& recType) {
+                return !allowedModelRecTypes.contains(recType);
+            });
+        }
+        shouldCheckRecTypes = true;
+        shouldForceBasePatch = false;
+    }
 
     // Init Handlers.
     HandlerLightPlacerTracker::init(pgd->lightPlacerJSONs());
@@ -168,9 +180,15 @@ void PGPatcher::patchMeshes(const bool& shouldMultithread,
     // Incremental runs: find the meshes whose previous output is still valid and remove outputs that are not.
     std::unordered_set<std::filesystem::path> skippable;
     if (PGRunCache::hasPreviousRun()) {
+        if (stageCallback)
+            stageCallback(MeshPatchStage::EvaluatingPreviousOutput);
+
         skippable = PGRunCache::evaluateMeshes(meshes, shouldMultithread, progressCallback);
         PGRunCache::pruneStaleOutputs(skippable);
     }
+
+    if (stageCallback)
+        stageCallback(MeshPatchStage::Patching);
 
     // Create task tracker.
     TaskTracker taskTracker("Mesh Patcher", meshes.size());
@@ -196,17 +214,21 @@ void PGPatcher::patchMeshes(const bool& shouldMultithread,
         meshRunner.addTask([&taskTracker,
                             &mesh,
                             &setModelUsesQueue,
-                            &forceBasePatch,
-                            &allowedModelRecTypes,
-                            &checkAllowedRecTypes,
+                            &shouldForceBasePatch,
+                            &recTypes,
+                            &shouldCheckRecTypes,
                             &excludeFacegens,
+                            &isPGLiteMode,
+                            &shouldRecalculateBounds,
                             &dryRun] {
             taskTracker.completeJob(patchNIF(mesh,
                                              setModelUsesQueue,
-                                             forceBasePatch,
-                                             allowedModelRecTypes,
-                                             checkAllowedRecTypes,
+                                             shouldForceBasePatch,
+                                             recTypes,
+                                             shouldCheckRecTypes,
                                              excludeFacegens,
+                                             isPGLiteMode,
+                                             shouldRecalculateBounds,
                                              dryRun));
         });
     }
@@ -215,8 +237,12 @@ void PGPatcher::patchMeshes(const bool& shouldMultithread,
     meshRunner.runTasks();
 
     // Apply the plugin model uses of all replayed meshes at once.
-    if (!replayedMeshResults.empty())
-        setModelUsesQueue.queueTask([results = std::move(replayedMeshResults)] { PGPlugin::setModelUses(results); });
+    if (!replayedMeshResults.empty()) {
+        setModelUsesQueue.queueTask([results = std::move(replayedMeshResults)] {
+            PGPlugin::setModelUses(results);
+            PGPlugin::setObjectBounds(results);
+        });
+    }
 
     // Final validation for weight variants.
     const auto weightVariantErrors = PGMeshPermutationTracker::validateWeightedVariants();
@@ -243,9 +269,6 @@ void PGPatcher::patchTextures(const bool& shouldMultithread,
     auto* const pgd = PGGlobals::pgd();
     pgd->waitForMeshMapping();
     pgd->waitForCMClassification();
-
-    // Init Handlers.
-    HandlerLightPlacerTracker::init(pgd->lightPlacerJSONs());
 
     // Incremental runs: replay reused generated textures and delete generated textures nobody needs anymore.
     PGRunCache::finalizeHooks();
@@ -278,27 +301,6 @@ auto PGPatcher::patchMeta() -> std::map<std::filesystem::path,
 {
     const std::shared_lock lock(s_meshPatchInfoMutex);
     return s_meshPatchInfo;
-}
-
-void PGPatcher::sortMatches(std::vector<PatcherUtil::ShaderPatcherMatch>& matches)
-{
-    std::ranges::sort(matches, [&](const PatcherUtil::ShaderPatcherMatch& a, const PatcherUtil::ShaderPatcherMatch& b) {
-        if (a.mod && !b.mod)
-            return true;
-
-        if (!a.mod && b.mod)
-            return false;
-
-        if ((a.mod && b.mod) && (a.mod->priority != b.mod->priority))
-            return a.mod->priority > b.mod->priority;
-
-        const auto aShader = a.shaderTransformTo != PGEnums::ShapeShader::Unknown ? a.shaderTransformTo : a.shader;
-        const auto bShader = b.shaderTransformTo != PGEnums::ShapeShader::Unknown ? b.shaderTransformTo : b.shader;
-        if (aShader != bShader)
-            return static_cast<int>(aShader) > static_cast<int>(bShader);
-
-        return a.match.matchedPath < b.match.matchedPath;
-    });
 }
 
 void PGPatcher::sortMatches(std::vector<MatchMeta>& matches,
@@ -367,17 +369,20 @@ void PGPatcher::deleteOutputDir(const bool& preOutput,
                                 const bool& shouldKeepIncrementalOutput)
 {
     static const std::unordered_set<std::filesystem::path> foldersToDelete
-        = { "meshes", "textures", "pbrnifpatcher", "lightplacer", "pbrtexturesets" };
+        = { "meshes", "textures", "calientetools", "pbrnifpatcher", "lightplacer", "pbrtexturesets" };
     static const std::filesystem::path updateCacheFile = boost::to_lower_copy(PGRunCache::s_cacheFilename.wstring());
     static const std::filesystem::path updateCacheTempFile = updateCacheFile.wstring() + L".tmp";
+    static const std::filesystem::path stockRecordsFile
+        = boost::to_lower_copy(std::wstring(PGPlugin::stockRecordsFile));
     static const std::unordered_set<std::filesystem::path> filesToDelete
-        = { "pgpatcher.esp", "parallaxgen_diff.json", updateCacheFile, updateCacheTempFile };
+        = { "pgpatcher.esp", "parallaxgen_diff.json", stockRecordsFile, updateCacheFile, updateCacheTempFile };
     static const std::vector<std::pair<std::wstring, std::wstring>> filesToDeleteParseRules = { { L"pg_", L".esp" } };
     static const std::unordered_set<std::filesystem::path> filesToIgnore = { "meta.ini" };
     static const std::unordered_set<std::filesystem::path> filesToDeletePreOutput = { "pgpatcher_output.zip" };
 
     // Kept when updating a previous output incrementally.
-    static const std::unordered_set<std::filesystem::path> foldersToKeepIncremental = { "meshes", "textures" };
+    static const std::unordered_set<std::filesystem::path> foldersToKeepIncremental
+        = { "meshes", "textures", "calientetools" };
     static const std::unordered_set<std::filesystem::path> filesToKeepIncremental = { updateCacheFile };
 
     const auto outputDir = PGGlobals::pgd()->generatedPath();
@@ -544,6 +549,8 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
                                         const std::unordered_set<PGPlugin::ModelRecordType>& allowedModelRecTypes,
                                         const bool& checkAllowedRecTypes,
                                         const bool& excludeFacegens,
+                                        const bool& isPGLiteMode,
+                                        const bool& shouldRecalculateBounds,
                                         const bool& dryRun)
 {
     const Logger::Prefix nifPrefix(nifPath.wstring());
@@ -584,9 +591,23 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
         return TaskTracker::Result::Success;
     }
 
-    if (nifCache.meshUses.empty() && !forceBasePatch && !isFacegen) {
+    // BodySlide ShapeData never appears in plugins either, so it is always patched for a dummy use like facegen.
+    const bool isBodySlideShapeData = PGNIFUtil::isBodySlideShapeDataMesh(nifPath);
+
+    if (nifCache.meshUses.empty() && !forceBasePatch && !isFacegen && !isBodySlideShapeData) {
         Logger::trace(L"Skipping NIF patching for mesh with no plugin uses: {}", nifPath.wstring());
         return TaskTracker::Result::Success;
+    }
+
+    if (isPGLiteMode && !isBodySlideShapeData) {
+        // Only what the 3rd party tools read: the record types the caller narrowed down, and never a facegen mesh.
+        const bool hasPatchableUse = std::ranges::any_of(nifCache.meshUses, [&](const auto& use) {
+            return !isUseUnpatched(use.second, allowedModelRecTypes, checkAllowedRecTypes);
+        });
+        if (isFacegen || !hasPatchableUse) {
+            Logger::trace(L"Skipping NIF patching for mesh the 3rd party tools do not read: {}", nifPath.wstring());
+            return TaskTracker::Result::Success;
+        }
     }
 
     meshTracker.load();
@@ -594,15 +615,16 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
     // Prepare meta.
     MeshMeta meshMeta;
 
-    if (nifCache.meshUses.empty() && (forceBasePatch || isFacegen)) {
+    if (nifCache.meshUses.empty() && (forceBasePatch || isFacegen || isBodySlideShapeData)) {
         // Add a dummy mesh use to trigger base patching (pgtools uses this since no plugins).
-        // Always trigger dummy for facegen meshes since they never appear in plugins.
+        // Always trigger dummy for facegen and BodySlide ShapeData meshes since they never appear in plugins.
         Logger::debug(L"Forcing non-plugin patching context for mesh: {}", nifPath.wstring());
         const PGMeshPermutationTracker::FormKey dummyFormKey = { .modKey = L"", .formID = 0, .subMODL = "" };
         const PGPlugin::MeshUseAttributes dummyUse = {
             .isWeighted = false,
             .isSinglepassMATO = false,
             .isFacegen = isFacegen,
+            .isBodySlideShapeData = isBodySlideShapeData,
             .isIgnored = false,
             .isDummyUse = true,
             .recType = PGPlugin::ModelRecordType::Unknown,
@@ -615,18 +637,16 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
         return TaskTracker::Result::Failure;
     }
 
+    // Alternate texture results of plugin uses that keep using the unchanged original mesh.
+    std::vector<std::pair<PGMeshPermutationTracker::FormKey, std::unordered_map<unsigned, PGTypes::TextureSet>>>
+        originalMeshAltTexResults;
+
     // Loop through each use.
     for (auto use : nifCache.meshUses) {
         // Process mesh patch for each and every occurance of the mesh in plugins.
-        if (use.second.isIgnored) {
-            // This record is ignored, trigger tracker to ignore the base mesh and skip this patch.
-            meshTracker.ignoreBaseMesh();
-            continue;
-        }
-
-        if (checkAllowedRecTypes && !use.second.isDummyUse && !allowedModelRecTypes.contains(use.second.recType)) {
-            // This record is not in the allowed record types, trigger tracker to ignore the base mesh and skip this
-            // patch.
+        if (isUseUnpatched(use.second, allowedModelRecTypes, checkAllowedRecTypes)) {
+            // An ignored record, or one outside the allowed record types: the tracker ignores the base mesh and the
+            // patch is skipped.
             meshTracker.ignoreBaseMesh();
             continue;
         }
@@ -640,9 +660,11 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
         // Stage a new mesh.
         auto* stagedNIF = meshTracker.stageMesh();
         std::unordered_set<unsigned> enforceCheckBlocks;
+        const auto alternateTexturesBefore = use.second.alternateTextures;
         if (!processNIF(nifPath,
                         stagedNIF,
                         meshMeta,
+                        use.second,
                         use.second.isSinglepassMATO,
                         formKey,
                         use.second.recType,
@@ -650,33 +672,98 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
                         enforceCheckBlocks)) {
             return TaskTracker::Result::Failure;
         }
-        if (meshTracker.commitMesh(formKey, use.second.isWeighted, use.second.alternateTextures, enforceCheckBlocks))
+
+        switch (
+            meshTracker.commitMesh(formKey, use.second.isWeighted, use.second.alternateTextures, enforceCheckBlocks)) {
+        case PGMeshPermutationTracker::CommitResult::Added:
             Logger::trace("Mesh committed");
-        else
-            Logger::trace("Mesh not committed (already exists or no changes)");
+            break;
+        case PGMeshPermutationTracker::CommitResult::MergedIntoOutput:
+            Logger::trace("Mesh not committed (identical to an existing output mesh)");
+            break;
+        case PGMeshPermutationTracker::CommitResult::UnchangedFromOriginal:
+            Logger::trace("Mesh not committed (no changes)");
+            if (use.second.alternateTextures != alternateTexturesBefore) {
+                // The mesh itself needed no changes (it was patched before, for example), but the alternate textures of
+                // this use were patched. They still have to reach the plugin, for the original mesh.
+                originalMeshAltTexResults.emplace_back(formKey, use.second.alternateTextures);
+            }
+            break;
+        case PGMeshPermutationTracker::CommitResult::AlreadyProcessed:
+            Logger::trace("Mesh not committed (form key already processed)");
+            break;
+        }
     }
+
+    // DynDOLOD reads the OBND of TREE and GRAS records to decide which of them get LOD billboards, and mods that add or
+    // replace those meshes often leave it unset or stale. Only the uses of those two types get one, from the saved mesh
+    // when PG outputs it and from the original mesh otherwise.
+    const auto isBoundsUse = [&](const PGPlugin::MeshUseAttributes& use) {
+        return (use.recType == PGPlugin::ModelRecordType::Tree || use.recType == PGPlugin::ModelRecordType::Grass)
+            && !isUseUnpatched(use, allowedModelRecTypes, checkAllowedRecTypes);
+    };
+    const bool hasBoundsUse = shouldRecalculateBounds
+        && std::ranges::any_of(originalMeshUses, [&](const auto& use) { return isBoundsUse(use.second); });
 
     // Save meshes. Skipped entirely in a dry run (the conflicts-only CLI path): everything the conflicts JSON needs
     // (PGModManager's shader/conflict sets) is already populated by the matching above. saveMeshes() only writes the
     // output NIF, creates output directories (and throws on a stale output file) and feeds the plugin model uses,
     // none of which a dry run may do.
-    decltype(meshTracker.saveMeshes()) saveResults;
+    decltype(meshTracker.saveMeshes(false, false)) saveResults;
     if (!dryRun) {
-        saveResults = meshTracker.saveMeshes();
-        setModelUsesQueue.queueTask([saveResults] { PGPlugin::setModelUses(saveResults.first); });
+        saveResults = meshTracker.saveMeshes(shouldRecalculateBounds, hasBoundsUse);
+
+        // The uses whose mesh PG outputs, collected before the entries below are appended: their results carry the bounds.
+        std::unordered_set<PGMeshPermutationTracker::FormKey, PGMeshPermutationTracker::FormKeyHash> savedFormKeys;
+        if (hasBoundsUse) {
+            for (const auto& meshResult : saveResults.first)
+                for (const auto& formKeyEntry : meshResult.altTexResults)
+                    savedFormKeys.insert(formKeyEntry.first);
+        }
+
+        if (!originalMeshAltTexResults.empty()) {
+            // No file is written for these uses: their records keep the original mesh and only get the patched alternate
+            // textures. The shapes are not reordered since the mesh is not saved, so the shape indices stay as they are.
+            saveResults.first.push_back(PGMeshPermutationTracker::MeshResult {
+                .meshPath = nifPath,
+                .altTexResults = std::move(originalMeshAltTexResults),
+                .idxCorrections = { },
+                .inverseIdxCorrectionsPatching = { },
+            });
+        }
+
+        if (hasBoundsUse) {
+            // The remaining uses keep the original mesh, so their records only get the bounds of it. Patchers never move
+            // vertices, so these match the bounds of an output mesh, except when a patcher deletes a shape (the TruePBR
+            // delete attribute), which is why the uses above take theirs from the saved mesh.
+            PGMeshPermutationTracker::MeshResult boundsResult { .meshPath = nifPath };
+            for (const auto& [formKey, attributes] : originalMeshUses)
+                if (isBoundsUse(attributes) && !savedFormKeys.contains(formKey))
+                    boundsResult.altTexResults.emplace_back(formKey, std::unordered_map<unsigned, PGTypes::TextureSet> { });
+
+            if (!boundsResult.altTexResults.empty()) {
+                boundsResult.objectBounds = meshTracker.originalObjectBounds();
+                if (boundsResult.objectBounds.has_value())
+                    saveResults.first.push_back(std::move(boundsResult));
+            }
+        }
+
+        setModelUsesQueue.queueTask([saveResults] {
+            PGPlugin::setModelUses(saveResults.first);
+            PGPlugin::setObjectBounds(saveResults.first);
+        });
 
         // Run handlers.
         for (const auto& meshResult : saveResults.first) {
-            Logger::Prefix(L"Handler: " + meshResult.meshPath.wstring());
+            const Logger::Prefix handlerPrefix(L"Handler: " + meshResult.meshPath.wstring());
             HandlerLightPlacerTracker::handleNIFCreated(nifPath, meshResult.meshPath);
         }
         // Add to diff JSON.
         const auto diffJSONKey = StringUtil::utf16toUTF8(nifPath.wstring());
         if (saveResults.second.second) {
             // Only add to diff if the base mesh actually saved, which is indicated by a non-zero patched crc32.
-            Logger::trace("Base mesh was updated, saving diff CRC32: {} -> {}",
-                          saveResults.second.first,
-                          saveResults.second.second);
+            Logger::trace(
+                "Base mesh was updated, saving diff CRC32: {} -> {}", saveResults.second.first, saveResults.second.second);
 
             const std::unique_lock lock(s_diffJSONMutex);
             s_diffJSON[diffJSONKey]["crc32original"] = saveResults.second.first;
@@ -701,457 +788,6 @@ TaskTracker::Result PGPatcher::patchNIF(const std::filesystem::path& nifPath,
     }
 
     return TaskTracker::Result::Success;
-}
-
-bool PGPatcher::processNIF(const std::filesystem::path& nifPath,
-                           nifly::NifFile* nif,
-                           MeshMeta& meshMeta,
-                           bool isSinglepassMATO,
-                           const PGMeshPermutationTracker::FormKey& formKey,
-                           const PGPlugin::ModelRecordType& modelRecordType,
-                           std::unordered_map<unsigned,
-                                              PGTypes::TextureSet>& alternateTextures,
-                           std::unordered_set<unsigned>& nonAltTexShapes)
-{
-    // Create patcher objects.
-    const auto patcherObjects = createNIFPatcherObjects(nifPath, nif);
-
-    // Get shapes and index 3ds (this is in the order as they would show up as 3d indices in plugins).
-    const auto shapes = PGNIFUtil::shapesWith3DIdx(nif);
-
-    meshMeta.formKeys.push_back(formKey);
-
-    size_t shapeMetaIdx = 0;
-    for (const auto& [nifShape, oldIndex3D] : shapes) {
-        const auto shapeBlockID = nif->GetBlockID(nifShape);
-        const auto shapeName = nifShape->name.get();
-        const Logger::Prefix shapePrefix(std::to_string(shapeBlockID) + "/" + shapeName + "/"
-                                         + std::to_string(oldIndex3D));
-
-        if (!nifShape) {
-            // Skip if shape is null (invalid shapes).
-            Logger::trace(L"Skipping: Shape is null");
-            continue;
-        }
-
-        if (!PGNIFUtil::isPatchableShape(*nif, *nifShape)) {
-            // Skip if not patchable shape.
-            Logger::trace(L"Skipping: Shape is not patchable");
-            continue;
-        }
-
-        auto& curMeshShapeMeta = meshMeta.shapeMeta[shapeMetaIdx++];
-        curMeshShapeMeta.blockID = shapeBlockID;
-        curMeshShapeMeta.shapeName = shapeName;
-
-        // The engine replaces the texture set of skin tint shapes with the actor's skin texture, so an
-        // alternate texture on one never renders. Ignore it to match vanilla behavior.
-        const auto* const shaderBSSP = dynamic_cast<nifly::BSShaderProperty*>(nif->GetShader(nifShape));
-        const bool isSkinTint
-            = (shaderBSSP != nullptr) && PGNIFUtil::hasShaderFlag(shaderBSSP, nifly::SLSF1_FACEGEN_RGB_TINT);
-
-        PGTypes::TextureSet* ptrAltTex = nullptr;
-        if (!isSkinTint && alternateTextures.contains(oldIndex3D)) {
-            ptrAltTex = &alternateTextures.at(oldIndex3D);
-        } else {
-            // We want to include any texture sets that do not have alternate textures defined to be compared.
-            nonAltTexShapes.insert(oldIndex3D);
-        }
-        if (!processNIFShape(nifPath,
-                             nif,
-                             nifShape,
-                             curMeshShapeMeta,
-                             patcherObjects,
-                             isSinglepassMATO,
-                             formKey,
-                             modelRecordType,
-                             ptrAltTex)) {
-            return false;
-        }
-    }
-
-    // Run global patchers.
-    for (const auto& globalPatcher : patcherObjects.globalPatchers) {
-        const Logger::Prefix prefixPatches(StringUtil::utf8toUTF16(globalPatcher->patcherName()));
-        if (globalPatcher->applyPatch())
-            meshMeta.globalPatchersApplied.push_back(globalPatcher->patcherName());
-    }
-
-    // Clear texture sets cache for this NIF.
-    PatcherMeshShader::clearTextureSets(nifPath);
-
-    return true;
-}
-
-bool PGPatcher::processNIFShape(const std::filesystem::path& nifPath,
-                                nifly::NifFile* nif,
-                                nifly::NiShape* nifShape,
-                                MeshShapeMeta& meshShapeMeta,
-                                const PatcherUtil::PatcherMeshObjectSet& patchers,
-                                bool isSinglepassMATO,
-                                const PGMeshPermutationTracker::FormKey& formKey,
-                                const PGPlugin::ModelRecordType& modelRecordType,
-                                PGTypes::TextureSet* alternateTexture)
-{
-    if (!nif)
-        throw std::runtime_error("NIF is null");
-
-    if (!nifShape)
-        throw std::runtime_error("NIFShape is null");
-
-    // Prep.
-    PGTypes::TextureSet slots;
-    if (!alternateTexture) {
-        slots = PatcherMesh::textureSet(nifPath, *nif, *nifShape);
-    } else {
-        Logger::trace("Alternate texture exist for this shape");
-        slots = *alternateTexture;
-    }
-
-    // Log slots.
-    Logger::trace("Texture Slots: {}", PGTypes::strFromTextureSlots(slots));
-
-    // Apply prepatchers.
-    for (const auto& prePatcher : patchers.prePatchers) {
-        const Logger::Prefix prefixPatches(prePatcher->patcherName());
-        if (prePatcher->applyPatch(slots, *nifShape)) {
-            meshShapeMeta.prePatchersApplied.push_back(prePatcher->patcherName());
-
-            if (nif->GetBlockID(nifShape) == nifly::NIF_NPOS) {
-                // Shape was deleted, nothing else to do.
-                return true;
-            }
-        }
-    }
-
-    if (PGNIFUtil::isShaderPatchableShape(*nif, *nifShape)) {
-        // Allowed shaders from result of patchers.
-        const auto matches
-            = PGPatcher::matches(slots, patchers, isSinglepassMATO, modelRecordType, &patchers, nifShape);
-        std::vector<PatcherUtil::ShaderPatcherMatch> enabledMatches;
-
-        // Add matches to mesh shape meta.
-        for (const auto& match : matches) {
-            MatchMeta matchMeta;
-            matchMeta.mod = match.mod;
-            matchMeta.shader = match.shader;
-            matchMeta.shaderTransformTo = match.shaderTransformTo;
-            matchMeta.matchedPath = match.match.matchedPath;
-
-            if (PGGlobals::isPGMMSet()) {
-                // Record which mod supplies each result texture so the conflict viewer can flag
-                // matches whose result textures come from different mods. Transformed matches get
-                // their slots from the transform's target shader (running the actual transform here
-                // would schedule texture generation); the source match path is kept for attribution
-                // since transform-generated files belong to no mod anyway.
-                auto resultShader = match.shader;
-                if (match.shaderTransformTo != PGEnums::ShapeShader::Unknown
-                    && patchers.shaderPatchers.contains(match.shaderTransformTo)) {
-                    resultShader = match.shaderTransformTo;
-                }
-
-                PGTypes::TextureSet resultSlots = slots;
-                patchers.shaderPatchers.at(resultShader)->applyPatchSlots(resultSlots, match.match);
-                for (size_t slot = 0; slot < resultSlots.size(); slot++) {
-                    if (resultSlots.at(slot).empty())
-                        continue;
-
-                    auto slotMod = PGGlobals::pgmm()->modByFileSmart(resultSlots.at(slot));
-                    if (slotMod) {
-                        matchMeta.resultTextureMods.emplace_back(static_cast<PGEnums::TextureSlots>(slot),
-                                                                 std::move(slotMod));
-                    }
-                }
-            }
-
-            meshShapeMeta.matches[formKey].push_back(matchMeta);
-
-            if (match.mod) {
-                const std::shared_lock lk(match.mod->mutex);
-                if (!match.mod->isEnabled)
-                    continue;
-            }
-
-            enabledMatches.push_back(match);
-        }
-
-        PatcherUtil::ShaderPatcherMatch winningShaderMatch;
-        // Get winning match.
-        if (!enabledMatches.empty()) {
-            winningShaderMatch = enabledMatches.at(0);
-
-            // Apply transforms.
-            if (applyTransformIfNeeded(winningShaderMatch, patchers))
-                Logger::trace("Shader transform was applied");
-
-            Logger::trace(L"Winning Match: {} / {} / {}",
-                          StringUtil::utf8toUTF16(PGEnums::strFromShader(winningShaderMatch.shader)),
-                          !winningShaderMatch.mod ? L"" : winningShaderMatch.mod->name,
-                          winningShaderMatch.match.matchedPath);
-
-            // Loop through patchers.
-            patchers.shaderPatchers.at(winningShaderMatch.shader)
-                ->applyPatch(slots, *nifShape, winningShaderMatch.match);
-
-            if (nif->GetBlockID(nifShape) == nifly::NIF_NPOS) {
-                // Shape was deleted, nothing else to do.
-                return true;
-            }
-        }
-    }
-
-    // Apply postpatchers.
-    for (const auto& postPatcher : patchers.postPatchers) {
-        const Logger::Prefix prefixPatches(postPatcher->patcherName());
-        if (postPatcher->applyPatch(slots, *nifShape)) {
-            meshShapeMeta.postPatchersApplied.push_back(postPatcher->patcherName());
-
-            if (nif->GetBlockID(nifShape) == nifly::NIF_NPOS) {
-                // Shape was deleted, nothing else to do.
-                return true;
-            }
-        }
-    }
-
-    if (!alternateTexture) {
-        // Assign texture set to nif.
-        PatcherMesh::setTextureSet(nifPath, *nif, *nifShape, slots);
-    } else {
-        // Assign new slots to propogate upstream for alternate textures.
-        *alternateTexture = slots;
-    }
-
-    Logger::trace("Texture Slots Modified: {}", PGTypes::strFromTextureSlots(slots));
-
-    return true;
-}
-
-uint64_t PGPatcher::digestMatches(const std::vector<PatcherUtil::ShaderPatcherMatch>& matches,
-                                  const PatcherUtil::PatcherMeshObjectSet& patchers)
-{
-    // Everything about the ordered match list that influences how the winning match is chosen and applied. Mod
-    // priorities are deliberately not part of the digest: only their effect (the order of the list) matters, so
-    // renumbering priorities when a mod is added does not invalidate meshes whose matches did not change.
-    HashUtil::Fnv1a64 hasher;
-    hasher.add(static_cast<uint64_t>(matches.size()));
-    for (const auto& match : matches) {
-        hasher.add(match.shader);
-        hasher.add(StringUtil::toLowerASCIIFast(match.match.matchedPath));
-
-        if (match.mod) {
-            const std::shared_lock modLock(match.mod->mutex);
-            hasher.add(match.mod->name);
-            hasher.add(match.mod->isEnabled);
-        } else {
-            hasher.add(std::wstring());
-            hasher.add(false);
-        }
-
-        const auto patcherIt = patchers.shaderPatchers.find(match.shader);
-        if (patcherIt != patchers.shaderPatchers.end())
-            hasher.add(patcherIt->second->matchExtraDataHash(match.match));
-    }
-
-    return hasher.value();
-}
-
-uint64_t PGPatcher::computeMatchesDigest(const std::filesystem::path& nifPath,
-                                         const PGTypes::TextureSet& slots,
-                                         bool isSinglepassMATO,
-                                         const PGPlugin::ModelRecordType& modelRecordType)
-{
-    // Shader patchers only need a NIF for canApply, which is not part of the digest.
-    PatcherUtil::PatcherMeshObjectSet patchers;
-    for (const auto& [shader, factory] : s_meshPatchers.shaderPatchers)
-        patchers.shaderPatchers.emplace(shader, factory(nifPath, nullptr));
-
-    const auto matches = PGPatcher::matches(slots, patchers, isSinglepassMATO, modelRecordType);
-    return digestMatches(matches, patchers);
-}
-
-std::vector<PatcherUtil::ShaderPatcherMatch> PGPatcher::matches(const PGTypes::TextureSet& slots,
-                                                                const PatcherUtil::PatcherMeshObjectSet& patchers,
-                                                                bool isSinglepassMATO,
-                                                                const PGPlugin::ModelRecordType& modelRecordType,
-                                                                const PatcherUtil::PatcherMeshObjectSet* patcherObjects,
-                                                                nifly::NiShape* shape)
-{
-    std::vector<PatcherUtil::ShaderPatcherMatch> matches;
-    uint64_t matchesDigest = 0;
-
-    // Every lookup made while building the match list is covered by the digest recorded below, so individual
-    // lookups are not recorded as dependencies.
-    {
-        const PGRunCache::SuspendRecording suspendRecording;
-
-        std::unordered_set<std::shared_ptr<PGModManager::Mod>, PGModManager::Mod::ModHash> modSet;
-        if (patcherObjects && patchers.shaderPatchers.size() != patcherObjects->shaderPatchers.size())
-            throw std::runtime_error("Patcher objects size mismatch");
-
-        if ((patcherObjects && !shape) || (!patcherObjects && shape))
-            throw std::runtime_error("If shape or patcherObjects is set, both must be set");
-
-        for (const auto& [shader, patcher] : patchers.shaderPatchers) {
-            // Note: name is defined in source code in UTF8-encoded files.
-            const Logger::Prefix prefixPatches(patcher->patcherName());
-
-            // Check if shader should be applied.
-            std::vector<PatcherMeshShader::PatcherMatch> curMatches;
-            if (!patcher->shouldApply(slots, curMatches)) {
-                Logger::trace(L"Rejecting: Shader not applicable");
-                continue;
-            }
-
-            for (const auto& match : curMatches) {
-                if (!PGGlobals::pgd()->isFile(match.matchedPath)) {
-                    Logger::trace(L"Rejecting: Matched path '{}' is not a file", match.matchedPath);
-                    continue;
-                }
-
-                PatcherUtil::ShaderPatcherMatch curMatch;
-                if (PGGlobals::isPGMMSet())
-                    curMatch.mod = PGGlobals::pgmm()->modByFileSmart(match.matchedPath);
-
-                curMatch.shader = shader;
-                curMatch.match = match;
-                curMatch.shaderTransformTo = PGEnums::ShapeShader::Unknown;
-
-                matches.push_back(curMatch);
-                if (curMatch.mod) {
-                    // Add mod to set.
-                    modSet.insert(curMatch.mod);
-                }
-            }
-        }
-
-        // Populate conflict mods if set.
-        if (!modSet.empty()) {
-            // Add mods to conflict set.
-            for (const auto& match : matches) {
-                if (!match.mod)
-                    continue;
-
-                const std::unique_lock lock(match.mod->mutex);
-
-                for (const auto& conflictMod : modSet)
-                    if (conflictMod != match.mod)
-                        match.mod->conflicts.insert(conflictMod);
-            }
-        }
-
-        // Sort before filtering (filtering preserves relative order) so the digest covers the complete ordered list,
-        // which is what incremental runs recompute without a loaded mesh.
-        sortMatches(matches);
-        matchesDigest = digestMatches(matches, patchers);
-
-        // Loop through matches and delete any that cannot apply.
-        // Verify shape can apply.
-        if (patcherObjects) {
-            for (auto it = matches.begin(); it != matches.end();) {
-                auto& curMatch = *it;
-
-                // Check canApply for this shape.
-                bool canApplyBaseShader = false;
-                {
-                    const auto& curPatcher = patcherObjects->shaderPatchers.at(curMatch.shader);
-                    canApplyBaseShader = curPatcher->canApply(*shape, isSinglepassMATO, modelRecordType);
-                }
-                bool canApplyTransformShader = false;
-
-                // See if transform is possible.
-                if (patchers.shaderTransformPatchers.contains(curMatch.shader)) {
-                    // A transform patcher is avilable, see if it should be applied.
-                    // Get objects.
-                    const auto& transformPatcherPair = patcherObjects->shaderTransformPatchers.at(curMatch.shader);
-                    auto* const transformPatcher = transformPatcherPair.second.get();
-
-                    // Check if transform should be applied.
-                    if (transformPatcher->shouldTransform(curMatch.match, canApplyBaseShader)) {
-                        // Transform can apply.
-                        const auto transformToShader = transformPatcherPair.first;
-                        {
-                            const auto& curPatcher = patcherObjects->shaderPatchers.at(transformToShader);
-                            canApplyTransformShader = curPatcher->canApply(*shape, isSinglepassMATO, modelRecordType);
-                        }
-
-                        if (canApplyTransformShader)
-                            curMatch.shaderTransformTo = transformToShader;
-                    }
-                }
-
-                if (!canApplyBaseShader) {
-                    // Base shaders can't do it, lets check transforms.
-                    if (curMatch.shaderTransformTo == PGEnums::ShapeShader::Unknown) {
-                        it = matches.erase(it);
-                        continue;
-                    }
-
-                    if (!canApplyTransformShader) {
-                        it = matches.erase(it);
-                        continue;
-                    }
-                }
-                ++it;
-            }
-
-            // Above, canApply assigned the transform targets and those take part in the ranking, so sort again to
-            // restore the final order the patchers rely on (the match at index 0 wins).
-            sortMatches(matches);
-        }
-    }
-
-    // Record the digest as a dependency of the mesh being patched (no-op unless recording).
-    PGRunCache::recordMatches(slots, isSinglepassMATO, modelRecordType, matchesDigest);
-
-    return matches;
-}
-
-bool PGPatcher::applyTransformIfNeeded(PatcherUtil::ShaderPatcherMatch& match,
-                                       const PatcherUtil::PatcherMeshObjectSet& patchers)
-{
-    // Transform if required.
-    if (match.shaderTransformTo != PGEnums::ShapeShader::Unknown) {
-        // Find transform object.
-        auto* const transform = patchers.shaderTransformPatchers.at(match.shader).second.get();
-
-        // Transform Shader.
-        transform->transform(match.match, match.match);
-
-        match.shader = match.shaderTransformTo;
-        match.shaderTransformTo = PGEnums::ShapeShader::Unknown;
-
-        return true;
-    }
-
-    return false;
-}
-
-PatcherUtil::PatcherMeshObjectSet PGPatcher::createNIFPatcherObjects(const std::filesystem::path& nifPath,
-                                                                     nifly::NifFile* nif)
-{
-    auto patcherObjects = PatcherUtil::PatcherMeshObjectSet();
-    for (const auto& factory : s_meshPatchers.prePatchers) {
-        auto patcher = factory(nifPath, nif);
-        patcherObjects.prePatchers.emplace_back(std::move(patcher));
-    }
-    for (const auto& [shader, factory] : s_meshPatchers.shaderPatchers) {
-        auto patcher = factory(nifPath, nif);
-        patcherObjects.shaderPatchers.emplace(shader, std::move(patcher));
-    }
-    for (const auto& [shader, factory] : s_meshPatchers.shaderTransformPatchers) {
-        auto transform = factory.second(nifPath, nif);
-        patcherObjects.shaderTransformPatchers[shader] = { factory.first, std::move(transform) };
-    }
-    for (const auto& factory : s_meshPatchers.postPatchers) {
-        auto patcher = factory(nifPath, nif);
-        patcherObjects.postPatchers.emplace_back(std::move(patcher));
-    }
-    for (const auto& factory : s_meshPatchers.globalPatchers) {
-        auto patcher = factory(nifPath, nif);
-        patcherObjects.globalPatchers.emplace_back(std::move(patcher));
-    }
-
-    return patcherObjects;
 }
 
 TaskTracker::Result PGPatcher::patchDDS(const std::filesystem::path& ddsPath)

@@ -11,6 +11,7 @@
 #include "patchers/PatcherMeshPostRestoreDefaultShaders.hpp"
 #include "patchers/PatcherMeshPreFixMeshLighting.hpp"
 #include "patchers/PatcherMeshPreFixTextureSlotCount.hpp"
+#include "patchers/PatcherMeshPreStockMarker.hpp"
 #include "patchers/PatcherMeshShaderComplexMaterial.hpp"
 #include "patchers/PatcherMeshShaderDefault.hpp"
 #include "patchers/PatcherMeshShaderTransformParallaxToCM.hpp"
@@ -21,10 +22,12 @@
 #include "patchers/PatcherTextureHookFixSSS.hpp"
 #include "patchers/base/PatcherUtil.hpp"
 #include "pgutil/PGMeshPermutationTracker.hpp"
+#include "pgutil/PGNIFUtil.hpp"
 #include "util/ExceptionHandler.hpp"
 #include "util/FileUtil.hpp"
 #include "util/StringUtil.hpp"
 
+#include "NifFile.hpp"
 #include <CLI/CLI.hpp>
 #include <cpptrace/from_current.hpp>
 #include <nlohmann/json.hpp>
@@ -36,15 +39,21 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iostream>
 #include <ranges>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <windows.h>
 
 using namespace std;
@@ -134,6 +143,13 @@ struct PGToolsCLIArgs {
         // default, so this dry-run scan reflects what a default-mode `patch` run would actually do.
         bool considerAllMeshes = false;
     } Conflicts;
+
+    struct GenDiffBlocks {
+        CLI::App* subCommand = nullptr;
+        filesystem::path original;
+        filesystem::path patched;
+        filesystem::path output = "PGStock_Output";
+    } GenDiffBlocks;
 };
 
 // PGPatcher's real GUI never scans every mesh it finds -- it passes a real mesh blocklist/allowlist/
@@ -287,7 +303,203 @@ void initLogger(const filesystem::path& logpath, bool enableDebug, bool enableTr
     }
 }
 
-void mainRunner(PGToolsCLIArgs& args)
+std::vector<std::byte> readFileBytes(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+        throw std::runtime_error("Unable to open file: " + StringUtil::utf16toUTF8(path.wstring()));
+
+    const auto size = static_cast<std::streamoff>(file.tellg());
+    if (size < 0)
+        throw std::runtime_error("Unable to read file: " + StringUtil::utf16toUTF8(path.wstring()));
+
+    file.seekg(0, std::ios::beg);
+    std::vector<std::byte> bytes(static_cast<size_t>(size));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!file)
+        throw std::runtime_error("Unable to read file: " + StringUtil::utf16toUTF8(path.wstring()));
+
+    return bytes;
+}
+
+bool isNIFFile(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec)
+        && StringUtil::toLowerASCIIFast(path.extension().wstring()) == L".nif";
+}
+
+/**
+ * @brief Checks whether a location is a folder or lies anywhere inside it
+ *
+ * @param subject Location to check (does not have to exist yet)
+ * @param folder Folder to check against
+ * @return true The location is the folder itself or one of its descendants
+ * @return false The location is somewhere else
+ */
+bool isPathWithin(const std::filesystem::path& subject,
+                  const std::filesystem::path& folder)
+{
+    std::error_code ec;
+    const auto canonicalSubject = std::filesystem::weakly_canonical(subject, ec);
+    if (ec)
+        return false;
+
+    const auto canonicalFolder = std::filesystem::weakly_canonical(folder, ec);
+    if (ec)
+        return false;
+
+    // Locations on different roots have no relative path at all.
+    const auto relative = canonicalSubject.lexically_relative(canonicalFolder);
+    return !relative.empty() && *relative.begin() != "..";
+}
+
+/**
+ * @brief Writes a copy of a patched mesh whose shapes carry PG_STOCK blocks for everything that differs from the
+ * original mesh
+ *
+ * @param originalFile Unpatched mesh
+ * @param patchedFile Patched mesh (left untouched)
+ * @param outputFile Where the copy is written
+ * @param[in,out] numMarkedShapes Incremented by the number of shapes that received a block
+ * @return true The copy was written
+ * @return false The meshes could not be processed (reported)
+ */
+bool markMeshPair(const std::filesystem::path& originalFile,
+                  const std::filesystem::path& patchedFile,
+                  const std::filesystem::path& outputFile,
+                  size_t& numMarkedShapes)
+{
+    const auto label = StringUtil::utf16toUTF8(patchedFile.wstring());
+
+    std::error_code ec;
+    if (std::filesystem::exists(outputFile, ec)
+        && (std::filesystem::equivalent(outputFile, patchedFile, ec)
+            || std::filesystem::equivalent(outputFile, originalFile, ec))) {
+        spdlog::error("{}: the output would overwrite an input mesh, skipping", label);
+        return false;
+    }
+
+    nifly::NifFile originalNif;
+    nifly::NifFile patchedNif;
+    try {
+        originalNif = PGNIFUtil::loadNIFFromBytes(readFileBytes(originalFile), false);
+        patchedNif = PGNIFUtil::loadNIFFromBytes(readFileBytes(patchedFile), false);
+    } catch (const std::exception& e) {
+        spdlog::error("{}: unable to load the meshes: {}", label, e.what());
+        return false;
+    }
+
+    const auto numMarked = PatcherMeshPreStockMarker::markPatchedShapes(originalNif, patchedNif, patchedFile.wstring());
+
+    // The blocks keep their order: sorting them can renumber the shapes, which the plugin of the mod addresses by index
+    // for its alternate textures. The new blocks simply follow the existing ones.
+    std::filesystem::create_directories(outputFile.parent_path(), ec);
+    if (patchedNif.Save(outputFile, { .optimize = false, .sortBlocks = false })) {
+        spdlog::error("{}: unable to save {}", label, StringUtil::utf16toUTF8(outputFile.wstring()));
+        return false;
+    }
+
+    // Only shapes of a mesh that was written count.
+    numMarkedShapes += numMarked;
+    return true;
+}
+
+/**
+ * @brief Runs the gendiffblocks command
+ *
+ * @param args Command arguments
+ * @return true Every mesh pair was written
+ * @return false The arguments were rejected or at least one mesh pair could not be processed (reported)
+ */
+bool runGenDiffBlocks(const decltype(PGToolsCLIArgs::GenDiffBlocks)& args)
+{
+    const auto original = std::filesystem::absolute(args.original);
+    const auto patched = std::filesystem::absolute(args.patched);
+    const auto output = std::filesystem::absolute(args.output);
+
+    if (!std::filesystem::exists(original) || !std::filesystem::exists(patched)) {
+        spdlog::critical("The original and the patched path must both exist");
+        return false;
+    }
+
+    const bool isOriginalFolder = std::filesystem::is_directory(original);
+    if (isOriginalFolder != std::filesystem::is_directory(patched)) {
+        spdlog::critical("The original and the patched path must both be folders or both be mesh files");
+        return false;
+    }
+
+    // Original mesh, patched mesh and the path of the output relative to the output folder.
+    std::vector<std::tuple<std::filesystem::path, std::filesystem::path, std::filesystem::path>> meshPairs;
+    if (!isOriginalFolder) {
+        meshPairs.emplace_back(original, patched, patched.filename());
+    } else {
+        // An output inside an input folder would be taken for input by the next run.
+        if (isPathWithin(output, original) || isPathWithin(output, patched)) {
+            spdlog::critical(
+                "The output folder must not be the original or the patched folder, nor lie inside one of them");
+            return false;
+        }
+
+        // Every patched mesh with an original counterpart is a pair. A mesh that only exists on one side is reported.
+        std::unordered_set<std::wstring> patchedRelPaths;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 patched, std::filesystem::directory_options::skip_permission_denied)) {
+            if (!isNIFFile(entry.path()))
+                continue;
+
+            const auto relPath = entry.path().lexically_relative(patched);
+            patchedRelPaths.insert(StringUtil::toLowerASCIIFast(relPath.wstring()));
+
+            const auto originalFile = original / relPath;
+            if (isNIFFile(originalFile)) {
+                meshPairs.emplace_back(originalFile, entry.path(), relPath);
+            } else {
+                spdlog::warn("{} only exists in the patched folder, skipping it",
+                             StringUtil::utf16toUTF8(relPath.wstring()));
+            }
+        }
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 original, std::filesystem::directory_options::skip_permission_denied)) {
+            if (!isNIFFile(entry.path()))
+                continue;
+
+            const auto relPath = entry.path().lexically_relative(original);
+            if (!patchedRelPaths.contains(StringUtil::toLowerASCIIFast(relPath.wstring()))) {
+                spdlog::warn("{} only exists in the original folder, skipping it",
+                             StringUtil::utf16toUTF8(relPath.wstring()));
+            }
+        }
+    }
+
+    size_t numWritten = 0;
+    size_t numMarkedShapes = 0;
+    size_t numFailed = 0;
+    for (const auto& [originalFile, patchedFile, relPath] : meshPairs)
+        if (markMeshPair(originalFile, patchedFile, output / relPath, numMarkedShapes))
+            numWritten++;
+        else
+            numFailed++;
+
+    spdlog::info("Wrote {} meshes with {} marked shapes to {}",
+                 numWritten,
+                 numMarkedShapes,
+                 StringUtil::utf16toUTF8(output.wstring()));
+    if (numFailed)
+        spdlog::warn("{} meshes could not be processed", numFailed);
+
+    return numFailed == 0;
+}
+
+/**
+ * @brief Runs the parsed command
+ *
+ * @param args Parsed arguments
+ * @return Exit code of the process
+ */
+int mainRunner(PGToolsCLIArgs& args)
 {
     // Welcome Message
     spdlog::info("Welcome to PGTools version {}!", PG_FULL_VERSION);
@@ -301,8 +513,13 @@ void mainRunner(PGToolsCLIArgs& args)
 #endif
 
     ExceptionHandler::setMainThread();
+    ExceptionHandler::setTaskGuard(ExceptionHandler::cppTraceGuard);
 
     PGMeshPermutationTracker::setRelaxWeightValidation(args.relaxWeightValidation);
+
+    // Check if gendiffblocks subcommand was used
+    if (args.GenDiffBlocks.subCommand->parsed())
+        return runGenDiffBlocks(args.GenDiffBlocks) ? 0 : 1;
 
     // Check if patch subcommand was used
     if (args.Patch.subCommand->parsed()) {
@@ -328,7 +545,7 @@ void mainRunner(PGToolsCLIArgs& args)
         auto bg = BethesdaGame(BethesdaGame::GameType::SkyrimSE, args.Patch.source.parent_path());
         auto pgd = PGDirectory(&bg, args.Patch.output);
         PGGlobals::setPGD(&pgd);
-        auto pgd3D = PGD3D(exePath / "cshaders");
+        auto pgd3D = PGD3D();
         PGGlobals::setPGD3D(&pgd3D);
 
         // Check if GPU needs to be initialized
@@ -501,7 +718,7 @@ void mainRunner(PGToolsCLIArgs& args)
             PatcherMeshShaderComplexMaterial::loadOptions(patcherDefs["complexmaterial"]);
         }
         if (patcherDefs.contains("truepbr")) {
-            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs());
+            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs(), args.multithreading);
             PatcherMeshShaderTruePBR::loadOptions(patcherDefs["truepbr"]);
         }
         if (patcherDefs.contains("parallaxtocm")) {
@@ -531,8 +748,15 @@ void mainRunner(PGToolsCLIArgs& args)
         // call exactly (PGPatcher/src/main.cpp:633-638) -- confirmed by reading it directly that the
         // GUI hardcodes true here, while this subcommand previously left it at its own false default,
         // meaning the allowedmodelrecordtypes setting.json field was silently ignored entirely.
-        PGPatcher::patchMeshes(
-            args.multithreading, args.Patch.considerAllMeshes, processingSettings.allowedModelRecTypes, true);
+        PGPatcher::patchMeshes(args.multithreading,
+                               args.Patch.considerAllMeshes,
+                               processingSettings.allowedModelRecTypes,
+                               true,
+                               false,
+                               false,
+                               {},
+                               {},
+                               patcherDefs.contains("recalculatebounds"));
         PGPatcher::patchTextures(args.multithreading);
 
         // Saving plugins / diff JSON -- REQUIRED, confirmed missing entirely until now. This
@@ -615,7 +839,7 @@ void mainRunner(PGToolsCLIArgs& args)
         auto bg = BethesdaGame(BethesdaGame::GameType::SkyrimSE, args.Conflicts.source.parent_path());
         auto pgd = PGDirectory(&bg, args.Conflicts.output);
         PGGlobals::setPGD(&pgd);
-        auto pgd3D = PGD3D(exePath / "cshaders");
+        auto pgd3D = PGD3D();
         PGGlobals::setPGD3D(&pgd3D);
 
         // GPU/shader init is needed for MESH patching too, not just textures -- confirmed by
@@ -713,7 +937,7 @@ void mainRunner(PGToolsCLIArgs& args)
             PatcherMeshShaderComplexMaterial::loadOptions(complexMaterialOptions);
         }
         if (args.Conflicts.patchers.contains("truepbr")) {
-            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs());
+            PatcherMeshShaderTruePBR::loadStatics(pgd.pbrJSONs(), args.multithreading);
             unordered_map<string, string> truePBROptions;
             PatcherMeshShaderTruePBR::loadOptions(truePBROptions);
         }
@@ -733,7 +957,10 @@ void mainRunner(PGToolsCLIArgs& args)
                                processingSettings.allowedModelRecTypes,
                                true,
                                false,
+                               false,
                                {},
+                               {},
+                               false,
                                true);
 
         // Serialize PGModManager's full mod list -- the NEW contract this subcommand exists to
@@ -773,6 +1000,8 @@ void mainRunner(PGToolsCLIArgs& args)
             cout << result.dump(2) << "\n";
         }
     }
+
+    return 0;
 }
 
 void addArguments(CLI::App& app,
@@ -866,6 +1095,20 @@ void addArguments(CLI::App& app,
     args.Conflicts.subCommand->add_flag("--consider-allmeshes",
                                         args.Conflicts.considerAllMeshes,
                                         "Consider all meshes, even those not in plugins, for patching");
+
+    args.GenDiffBlocks.subCommand = app.add_subcommand("gendiffblocks",
+                                                       "Record the stock state of pre-patched meshes in PG_STOCK extra "
+                                                       "data blocks, so that PGPatcher can patch them from stock");
+    args.GenDiffBlocks.subCommand
+        ->add_option("original", args.GenDiffBlocks.original, "Original (unpatched) mesh file or folder")
+        ->required();
+    args.GenDiffBlocks.subCommand->add_option("patched", args.GenDiffBlocks.patched, "Patched mesh file or folder")
+        ->required();
+    args.GenDiffBlocks.subCommand
+        ->add_option("output",
+                     args.GenDiffBlocks.output,
+                     "Output folder that receives the patched meshes with their PG_STOCK blocks")
+        ->default_str("PGStock_Output");
 }
 }
 
@@ -916,13 +1159,13 @@ auto main(int argC,
     initLogger(exePath / "log" / "PGPatcher.log", enableDebug, enableTrace);
 
     // Main Runner (Catches all exceptions)
-    CPPTRACE_TRY { mainRunner(args); }
+    int returnCode = 0;
+    CPPTRACE_TRY { returnCode = mainRunner(args); }
     CPPTRACE_CATCH(const exception& e)
     {
         ExceptionHandler::setException(e, cpptrace::from_current_exception().to_string());
     }
 
-    int returnCode = 0;
     if (ExceptionHandler::hasException()) {
         ExceptionHandler::throwExceptionOnMainThread();
         returnCode = 1;

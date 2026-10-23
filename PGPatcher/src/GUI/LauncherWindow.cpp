@@ -289,8 +289,16 @@ LauncherWindow::LauncherWindow(PGConfig& pgc,
     //
     // Global Patchers.
     //
-    // auto* globalPatcherSizer = new wxStaticBoxSizer(wxVERTICAL, this, "Global Patchers");
-    // rightSizer->Add(globalPatcherSizer, 0, wxEXPAND | wxALL, borderSize);
+    auto* globalPatcherSizer = new wxStaticBoxSizer(wxVERTICAL, this, pgTr("launcher.globalPatchers.title"));
+
+    m_globalPatcherRecalculateBoundsCheckbox
+        = new wxCheckBox(this, wxID_ANY, pgTr("launcher.globalPatchers.recalculateBounds.label"));
+    m_globalPatcherRecalculateBoundsCheckbox->SetToolTip(pgTr("launcher.globalPatchers.recalculateBounds.tooltip"));
+    m_globalPatcherRecalculateBoundsCheckbox->Bind(
+        wxEVT_CHECKBOX, &LauncherWindow::onGlobalPatcherRecalculateBoundsChange, this);
+    globalPatcherSizer->Add(m_globalPatcherRecalculateBoundsCheckbox, 0, wxALL, borderSize);
+
+    rightSizer->Add(globalPatcherSizer, 0, wxEXPAND | wxALL, borderSize);
 
     //
     // Processing and RUN buttons.
@@ -407,6 +415,11 @@ LauncherWindow::LauncherWindow(PGConfig& pgc,
     m_processingEnableTraceLoggingCheckbox->Bind(
         wxEVT_CHECKBOX, &LauncherWindow::onProcessingEnableTraceLoggingChange, this);
     processingCheckboxSizer->Add(m_processingEnableTraceLoggingCheckbox, 0, wxALL, borderSize);
+
+    m_processingPGLiteModeCheckbox = new wxCheckBox(this, wxID_ANY, pgTr("launcher.processing.pgliteMode.label"));
+    m_processingPGLiteModeCheckbox->SetToolTip(pgTr("launcher.processing.pgliteMode.tooltip"));
+    m_processingPGLiteModeCheckbox->Bind(wxEVT_CHECKBOX, &LauncherWindow::onProcessingPGLiteModeChange, this);
+    processingCheckboxSizer->Add(m_processingPGLiteModeCheckbox, 0, wxALL, borderSize);
 
     processingOptionsHorizontalSizer->Add(processingCheckboxSizer, 0, wxALL, borderSize);
 
@@ -546,6 +559,7 @@ void LauncherWindow::setUIParams(const PGConfig::PGParams& initParams)
     m_processingEnableDevModeCheckbox->SetValue(initParams.processing.enableModDevMode);
     m_processingEnableDebugLoggingCheckbox->SetValue(initParams.processing.enableDebugLogging);
     m_processingEnableTraceLoggingCheckbox->SetValue(initParams.processing.enableTraceLogging);
+    m_processingPGLiteModeCheckbox->SetValue(initParams.processing.isPGLiteMode);
     m_meshRulesAllowListState = initParams.processing.allowList;
     m_meshRulesBlockListState = initParams.processing.blockList;
     m_textureRulesTextureMapsState = initParams.processing.textureMaps;
@@ -568,6 +582,7 @@ void LauncherWindow::setUIParams(const PGConfig::PGParams& initParams)
     m_postPatcherHairFlowMapCheckbox->SetValue(initParams.postPatcher.isHairFlowMapEnabled);
 
     // Global Patchers.
+    m_globalPatcherRecalculateBoundsCheckbox->SetValue(initParams.globalPatcher.isRecalculateBoundsEnabled);
 }
 
 // Component event handlers.
@@ -642,6 +657,8 @@ void LauncherWindow::onProcessingEnableTraceLoggingChange([[maybe_unused]] wxCom
     updateDisabledElements();
 }
 
+void LauncherWindow::onProcessingPGLiteModeChange([[maybe_unused]] wxCommandEvent& event) { updateDisabledElements(); }
+
 void LauncherWindow::onPrePatcherFixMeshLightingChange([[maybe_unused]] wxCommandEvent& event)
 {
     updateDisabledElements();
@@ -669,6 +686,11 @@ void LauncherWindow::onPostPatcherRestoreDefaultShadersChange([[maybe_unused]] w
 void LauncherWindow::onPostPatcherFixSSSChange([[maybe_unused]] wxCommandEvent& event) { updateDisabledElements(); }
 
 void LauncherWindow::onPostPatcherHairFlowMapChange([[maybe_unused]] wxCommandEvent& event)
+{
+    updateDisabledElements();
+}
+
+void LauncherWindow::onGlobalPatcherRecalculateBoundsChange([[maybe_unused]] wxCommandEvent& event)
 {
     updateDisabledElements();
 }
@@ -746,6 +768,7 @@ void LauncherWindow::getParams(PGConfig::PGParams& params) const
     params.processing.enableModDevMode = m_processingEnableDevModeCheckbox->GetValue();
     params.processing.enableDebugLogging = m_processingEnableDebugLoggingCheckbox->GetValue();
     params.processing.enableTraceLogging = m_processingEnableTraceLoggingCheckbox->GetValue();
+    params.processing.isPGLiteMode = m_processingPGLiteModeCheckbox->GetValue();
     params.processing.allowList = m_meshRulesAllowListState;
     params.processing.blockList = m_meshRulesBlockListState;
     params.processing.textureMaps = m_textureRulesTextureMapsState;
@@ -768,6 +791,7 @@ void LauncherWindow::getParams(PGConfig::PGParams& params) const
     params.postPatcher.isHairFlowMapEnabled = m_postPatcherHairFlowMapCheckbox->GetValue();
 
     // Global Patchers.
+    params.globalPatcher.isRecalculateBoundsEnabled = m_globalPatcherRecalculateBoundsCheckbox->GetValue();
 }
 
 void LauncherWindow::onBrowseGameLocation([[maybe_unused]] wxCommandEvent& event)

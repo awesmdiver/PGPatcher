@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -14,9 +15,9 @@ constexpr unsigned numTextureSlots = 9;
  * @brief Namespace containing core texture and mesh type definitions used throughout PGPatcher.
  */
 namespace PGTypes {
-/// @brief Array of wide-string texture paths indexed by texture slot (up to NUM_TEXTURE_SLOTS entries).
+/// @brief Array of wide-string texture paths indexed by texture slot (numTextureSlots entries).
 using TextureSet = std::array<std::wstring, numTextureSlots>;
-/// @brief Array of narrow-string texture paths indexed by texture slot (up to NUM_TEXTURE_SLOTS entries).
+/// @brief Array of narrow-string texture paths indexed by texture slot (numTextureSlots entries).
 using TextureSetStr = std::array<std::string, numTextureSlots>;
 
 /**
@@ -44,7 +45,8 @@ struct TextureSetHash {
 /**
  * @brief Parses a comma-separated string of texture slot paths into a TextureSet.
  *
- * @param slots Comma-separated UTF-8 texture paths (up to NUM_TEXTURE_SLOTS entries).
+ * @param slots Comma-separated UTF-8 texture paths. Entries beyond numTextureSlots are dropped, missing ones stay
+ * empty.
  * @return TextureSet populated from the parsed paths.
  */
 TextureSet textureSlotsFromStr(const std::string& slots);
@@ -74,7 +76,15 @@ struct CMClassification {
     bool operator==(const CMClassification& other) const = default;
 };
 
-/// @brief texture used by parallaxgen with type
+/// @brief Bounding box of a mesh in model space, matching the layout of a plugin record's OBND subrecord.
+struct ObjectBounds {
+    std::array<int16_t, 3> min { };
+    std::array<int16_t, 3> max { };
+
+    bool operator==(const ObjectBounds& other) const = default;
+};
+
+/// @brief A texture of the load order together with its classified type
 struct PGTexture {
     /// @brief relative path in the data directory
     std::filesystem::path path;

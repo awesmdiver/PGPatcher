@@ -14,11 +14,11 @@ As every PR is squashed when merging automatically, the commit messages within t
 
 All PRs will be reviewed by GitHub copilot, alongside a human maintainer. Often copilot has erroneous results but it is good to read what it has to say regardless.
 
-If your change is a user-facing change (ie. not a refactor, CI, or other project change), a changelog entry in `CHANGELOG.md` is required.
+If your change is a user-facing change (ie. not a refactor, CI, or other project change), a changelog entry under `## UNRELEASED` in `CHANGELOG.md` is required. A CI check fails when an entry lands in a section that was already released, which happens when a branch made before a release appended its entry to the old `## UNRELEASED` section.
 
 ### Versioning
 
-This project uses the [semantic versioning v2 specification](https://semver.org/). Versions are determined automatically based on the conventional commit titles used between tags. The manually triggered `Build and Publish Release` workflow will build the main branch, determine the next release version, and then create a draft release to be approved manually. Pre-releases are occasionally released for community feedback. These have the format `0.0.0-preX` where X is the number of commits since the last tag.
+This project uses the [semantic versioning v2 specification](https://semver.org/). Versions are determined automatically based on the conventional commit titles used between tags. The manually triggered `Build and Publish Release` workflow will build the main branch, determine the next release version, and then create a draft release to be approved manually. Its optional `version` input releases the version given there instead of the calculated one, as long as that version's tag does not exist yet. For a stable release it also commits the dated changelog to main: the `## UNRELEASED` section becomes the section of that version, dated the day of the run, below a new empty `## UNRELEASED` section. If `CHANGELOG.md` changed on main while the release was building, that change comes as a pull request instead, to be merged before the draft release is published. Pre-releases are occasionally released for community feedback. These have the format `0.0.0-preX` where X is the number of commits since the last tag.
 
 Tags are exclusively used to designate versions in this repository.
 
@@ -36,11 +36,22 @@ python scripts/run_clang_tidy.py
 
 It picks up `buildRelease/` or `build/` automatically; pass `--build-dir` for anything else. It needs the LLVM release pinned in `scripts/clang-tidy-version.txt` first on PATH (CI downloads it from llvm-project; locally, install the same release) and refuses any other version. The script's docstring explains why a plain clang-tidy invocation is not enough here.
 
+The build itself has to stay warning free. The `Build PGPatcher` workflow keeps the output of its build and fails on any compiler, linker or C# warning in it (`scripts/check_build_warnings.py`; its docstring says what counts). To run the same check on your own build:
+
+```
+./buildRelease.ps1 -NoZip 2>&1 | Tee-Object build.log
+python scripts/check_build_warnings.py build.log
+```
+
+A warning is only printed for a file that was compiled, so after a header change check a from-scratch build rather than an incremental one.
+
 The [Webkit](https://webkit.org/code-style-guidelines/) style is used for all C++ code. Clang-format and clang-tidy will enforce this.
 
 ### Unit Tests
 
-There are none! As I work on this project for fun, I have no intention of writing unit tests. I am aware of the drawbacks of not doing so and have decided it is worth it to avoid the turmoil. If you would like to make and maintain unit tests for this project, I am happy to merge them.
+The `PGTests` module holds [googletest](https://github.com/google/googletest) unit tests for `PGLib` and `PGMutagen` (the GUI and the CLI are not unit tested). They build with the rest of the project (CMake's `BUILD_TESTING`, on by default) into `pgtests.exe` next to the application binaries, and run from that `bin` folder, either directly or through `ctest --test-dir buildRelease`. Tests that need a GPU or the vanilla Skyrim installation skip when those are not available; set `PG_TEST_SKYRIM_DIR` to point the vanilla tests at another installation.
+
+New code in `PGLib` or `PGMutagen` should come with tests. The helpers in `PGTests/include` build NIFs, DDS textures, BSAs, plugins and a fake game folder on the fly, so tests need no checked in game assets.
 
 ## Environment Setup
 
@@ -60,7 +71,11 @@ There are none! As I work on this project for fun, I have no intention of writin
 
 ## Modules
 
-This section will dive deeper into the individual components of PG. PGPatcher is split into 4 CMake modules, all of which are included in the main `CMakeLists.txt`.
+This section will dive deeper into the individual components of PG. PGPatcher is split into 5 CMake modules, all of which are included in the main `CMakeLists.txt`, plus `PGLite`, which is a standalone configure (see below).
+
+### PGLite
+
+`PGLite` is the SKSE plugin version of PGPatcher (`PGLite/DESIGN.md` has the design, `PGLite/README.md` the user facing differences). It is not part of the root configure: a configure has one vcpkg triplet, and the plugin is one statically linked DLL (x64-windows-static, static CRT, C++23 for CommonLibSSE-NG), so `PGLite/CMakeLists.txt` is configured on its own (`buildRelease.ps1` does it after the root build) and compiles the shared `PGLib` sources a second time as a static library without the offline-only units (the runners, the Mutagen plugin implementation, the update cache, the stack trace task guard, the pgtools-only particle lights and HDR patchers). `external/CommonLibSSE-NG` is its submodule. Every change to `PGLib` has to build there as well. The module has no unit tests of its own; the shared code it uses is tested through `PGTests`.
 
 ### PGLib
 
